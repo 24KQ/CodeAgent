@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,19 @@ from firstcoder.harness.task_state import TaskState
 
 def _state(tmp_path: Path, run_id: str = "run_abc") -> TaskState:
     return TaskState.create("t1", "user request", run_id=run_id)
+
+
+def _try_make_junction(link: Path, target: Path) -> bool:
+    """Windows 上用 mklink /J 创建 junction（普通用户即可，无需管理员）。
+    非 Windows 或创建失败返回 False，调用方据此 skip。"""
+    if os.name != "nt":
+        return False
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
 
 
 def test_start_run_creates_layout(tmp_path: Path) -> None:
@@ -129,6 +144,19 @@ def test_run_dir_rejects_symlink_aliasing_another_run(tmp_path: Path) -> None:
         link.symlink_to(tmp_path / "runs" / "run_a", target_is_directory=True)
     except OSError:
         pytest.skip("symlink creation not permitted on this host")
+    with pytest.raises(ValueError):
+        store.run_dir("run_b")
+
+
+def test_run_dir_rejects_junction_aliasing_another_run(tmp_path: Path) -> None:
+    """Windows junction 指向 store 内另一个 run 也必须拒绝（Codex re-review #4）：
+    Python 3.12 起 is_symlink 与 is_junction 分离，junction 对 is_symlink()
+    返回 False，需显式检查；且 junction 普通用户即可创建，无需管理员。"""
+    store = RunStore(tmp_path / "runs")
+    store.start_run(_state(tmp_path, run_id="run_a"))
+    link = tmp_path / "runs" / "run_b"
+    if not _try_make_junction(link, tmp_path / "runs" / "run_a"):
+        pytest.skip("junction creation not available on this host")
     with pytest.raises(ValueError):
         store.run_dir("run_b")
 

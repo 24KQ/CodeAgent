@@ -32,6 +32,20 @@ _WINDOWS_RESERVED_NAMES = frozenset(
 )
 
 
+def _is_link_or_junction(path: Path) -> bool:
+    """路径是 symlink 或 Windows junction（目录重解析点）即为链接。
+
+    Python 3.12 起 `Path.is_symlink()` 与 `Path.is_junction()` 分离：
+    3.12 上 junction 对 `is_symlink()` 返回 False，必须显式检查
+    （Codex re-review #4 指出）。3.11 及以前 `os.path.islink` 已涵盖
+    junction，`is_junction` 不存在，用 getattr 兼容。
+    """
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    return bool(is_junction and is_junction())
+
+
 class RunStore:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
@@ -53,17 +67,25 @@ class RunStore:
     def run_dir(self, run_id: object) -> Path:
         value = self._check_run_id(run_id)
         candidate = self.root / value
-        if candidate.is_symlink():
+        if _is_link_or_junction(candidate):
             # is_symlink()（lexists 语义）能抓住断裂链接——exists() 对断裂
-            # symlink 返回 False。run 目录不允许是任何形式的链接：既防逃逸
-            # 出 store root，也防指向 store 内其他 run 的别名破坏 run 隔离
-            # （Codex P1 review fix 复验）。
-            raise ValueError(f"run dir {value!r} must not be a symlink")
+            # symlink 返回 False；is_junction() 补上 Python 3.12 起与
+            # symlink 分离的 Windows junction（普通用户可创建、无需管理员）。
+            # run 目录不允许是任何形式的链接：既防逃逸出 store root，也防
+            # 指向 store 内其他 run 的别名破坏 run 隔离（Codex P1 review fix）。
+            raise ValueError(f"run dir {value!r} must not be a symlink or junction")
         if candidate.exists():
             root = self.root.resolve()
             resolved = candidate.resolve()
             if root not in resolved.parents:
                 raise ValueError(f"run dir {value!r} resolves outside the store root")
+        # 威胁模型边界（Codex re-review #4 正式接受）：本方法防御的是预置的
+        # 静态路径欺骗——恶意 run_id、store 内被预置的 symlink/junction
+        # 别名或逃逸。不防御"检查后、使用前"的并发路径替换（目录级 TOCTOU）：
+        # 那要求攻击者能在 store root 内创建或替换目录条目，而 store root
+        # 的写入者只有 agent 运行时与用户；能这么做的攻击者已可直接替换
+        # store root 本身（root 无法自证），超出本类防御范围。文件级
+        # TOCTOU 由 `_open_no_follow`（O_NOFOLLOW）缩窗。
         return candidate
 
     def task_state_path(self, run_id: object) -> Path:
@@ -118,13 +140,17 @@ class RunStore:
 
     @staticmethod
     def _open_no_follow(path: Path, flags: int) -> int:
-        """is_symlink 前置检查 + POSIX O_NOFOLLOW 双保险（Codex P1 review fix）。
+        """链接前置检查 + POSIX O_NOFOLLOW 双保险（Codex P1 review fix）。
 
-        Windows 无 O_NOFOLLOW flag：前置检查与 open 之间仍存在理论 TOCTOU
-        窗口（需攻击者并发替换文件），记录为残留风险。
+        残留窗口如实记录，不声称完全闭合：
+        - POSIX：O_NOFOLLOW 只保护最终文件组件，不保护父目录——攻击者把
+          run 目录替换为指向外部的链接时，open 仍会跟随（目录级 TOCTOU，
+          威胁模型边界见 `run_dir`，已正式接受）。
+        - Windows：无 O_NOFOLLOW flag，前置检查与 open 之间对最终文件
+          组件也存在理论 TOCTOU（需攻击者并发替换文件）。
         """
-        if path.is_symlink():
-            raise ValueError(f"{path} is a symlink; refusing to follow")
+        if _is_link_or_junction(path):
+            raise ValueError(f"{path} is a symlink or junction; refusing to follow")
         no_follow = getattr(os, "O_NOFOLLOW", 0)
         try:
             return os.open(path, flags | no_follow)
@@ -134,6 +160,7 @@ class RunStore:
             raise
 
     def _read_no_follow(self, path: Path) -> str:
+        """以 O_RDONLY 读取文件，链接前置检查 + O_NOFOLLOW（同 `_open_no_follow`）。"""
         fd = self._open_no_follow(path, os.O_RDONLY)
         with os.fdopen(fd, "r", encoding="utf-8") as handle:
             return handle.read()
