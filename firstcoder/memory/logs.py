@@ -67,12 +67,21 @@ def append_to_daily_log(
 ) -> Path | None:
     """追加一条带时间戳的日志行；`source` 给定时在同一把 `.daily.lock` 内
     追加当天 evidence 侧车行（原子读改写，行序与日志一致）。空 entry 返回 None。
+
+    崩溃一致性（recovery 语义，Codex P2 review #3）：日志与侧车是两个
+    文件、两次替换，进程在两次替换之间崩溃会留下孤儿日志行（无侧车行）
+    或孤儿侧车行（有侧车无日志行）。恢复策略：孤儿日志行按"无证据的普通
+    记忆"处理（P3 /remember 正常提升）；孤儿侧车行被读取方忽略
+    （load_daily_log_evidence 只按侧车行读，不承诺配对完整性）。
     """
     entry = str(entry).strip()
     if not entry:
         return None
     memory_dir = Path(memory_dir)
     ensure_no_link_or_junction(memory_dir)
+    # logs 目录本身也可能被预置为 symlink/junction（Codex P2 review #3）：
+    # _transaction 只覆盖 store 写路径，这里必须覆盖 standalone/委托入口。
+    ensure_no_link_or_junction(memory_dir / "logs")
     path = daily_log_path(memory_dir, today=today)
     timestamp = datetime.now().strftime("%H:%M")
     evidence_path = path.with_name(path.stem + ".evidence.jsonl")

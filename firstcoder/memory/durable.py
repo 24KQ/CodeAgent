@@ -271,7 +271,10 @@ class DurableMemoryStore:
                 "session_id": "legacy",
                 "source_path": None,
                 "created_at": created_at,
-                "evidence_anchor_hash": None,
+                # metadata 与 MemoryEvidence.anchor_hash 统一用空字符串表示
+                # “尚未计算”；workspace 外路径也必须保持这个空值，不能因
+                # 路径越界而尝试读取外部文件。
+                "evidence_anchor_hash": "",
             },
             "scope": self._scope(),
         }
@@ -294,6 +297,11 @@ class DurableMemoryStore:
             )
             if anchor:
                 default_evidence["evidence_anchor_hash"] = anchor
+        # 兼容旧 metadata 中的 null，并统一“无合法锚点”的持久化形状。
+        # 特别是 workspace 外绝对 source_path 经边界校验后没有可计算路径，
+        # 此时应留下空字符串而不是让 None 继续流入 metadata。
+        if not default_evidence.get("evidence_anchor_hash"):
+            default_evidence["evidence_anchor_hash"] = ""
         row["evidence"] = default_evidence
         row.setdefault("scope", self._scope())
         return row
@@ -340,7 +348,14 @@ class DurableMemoryStore:
         for note in notes:
             row = self._metadata_for_note(topic, note["text"], metadata, topic_path=path)
             note.update(row)
-            if row["note_id"] not in metadata or not metadata_exists:
+            stored = metadata.get(row["note_id"])
+            if stored is None or not metadata_exists:
+                metadata_changed = True
+            elif (stored.get("evidence") or {}).get(
+                "evidence_anchor_hash"
+            ) != (row.get("evidence") or {}).get("evidence_anchor_hash"):
+                # 锚点回填（source_path 存在时自动计算，Codex P2 review #3）：
+                # 已有 row 补上 anchor 也必须落盘，否则每次读取重复计算。
                 metadata_changed = True
             metadata[row["note_id"]] = row
         if metadata_changed:
@@ -370,17 +385,21 @@ class DurableMemoryStore:
     def promote(self, promotions: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
         """把 (topic, note_text) 提升为 durable 笔记，返回 (results, superseded)。
 
-        一致性模型（M3 版本号/CAS 升级，Codex P2 review #1）：
+        一致性模型（recovery-on-read，M3 版本号/CAS；Codex P2 review #1
+        三轮收敛后的明确语义）：
         - 整个提升在同一把 store 锁（`_transaction`）内完成，读写互斥；
+          未崩溃时复合写对持锁读者是原子的（全部可见或全部不可见）；
         - 对每个 topic：topic 文件先落盘、metadata 后落盘（`_write_topic`
           内部顺序），两者之间的崩溃窗口由持锁读取的惰性 metadata 回填
           自愈——读取永远能得到与 topic 文件一致的新 metadata；
-        - index 最后发布为全局提交点：读者持锁要么看到旧 index（新 topic
-          未注册，等价旧版本），要么看到含新 topic 的完整新 index；
+        - index 最后发布，是**新 topic 可见性**的提交点：index 驱动读取
+          （read_index/snapshot/retrieval）只遍历 index 注册的 topic，
+          新 topic 未被注册即不可见；已注册 topic 的内容更新是写即所见
+          （recovery-on-read）：崩溃后读到的是已写入的新内容，不是旧版本；
         - index 带递增版本号（`- version: N`），供外部检测代次；
-        - 崩溃（进程被杀）可能留下已写但未注册的 topic/metadata，不会
-          产生撕裂可见性；index 未推进时，下一次 promote（含重复 note）
-          会把 index 补发到最新版本（自愈）。
+        - 崩溃（进程被杀）可能留下已写但未注册的 topic/metadata：已注册
+          topic 的新内容立即可读，新 topic 等下一次 promote（含重复 note）
+          把 index 补发到最新版本后可见（自愈）。
         """
         if not promotions:
             return [], []
@@ -489,7 +508,8 @@ class DurableMemoryStore:
         """读取当天 evidence 侧车（P3 /remember 的证据来源）。
 
         返回侧车行列表；无侧车文件返回空列表。持 `.daily.lock` 读取，
-        与写入互斥（Codex P2 review #4）。
+        与写入互斥（Codex P2 review #4）。崩溃恢复语义见
+        `logs.append_to_daily_log`：孤儿侧车行被忽略，不承诺与日志行配对。
         """
         from firstcoder.memory.logs import daily_log_path
 
@@ -545,10 +565,17 @@ class DurableMemoryStore:
                     )
                     if anchor:
                         evidence["evidence_anchor_hash"] = anchor
+                # 统一 legacy null 和 workspace 外路径的无锚点表示，避免
+                # sidecar/metadata 在同一份证据契约中出现两种空值。
+                if not evidence.get("evidence_anchor_hash"):
+                    evidence["evidence_anchor_hash"] = ""
                 row["evidence"] = evidence
             # scope 落在 row 顶层（`_default_note_metadata` 约定）；
-            # 契约里的 scope（如 "global"）必须持久化（Codex P2 review #3）。
-            if note.evidence.scope:
+            # 显式契约 scope（如 "global"）必须持久化；默认值 "workspace"
+            # 是契约占位，不得覆盖 promote 写入的真实 workspace fingerprint
+            # （Codex P2 review #3：原实现无条件覆盖导致指纹丢失、
+            # 检索 scope_mismatch）。
+            if note.evidence.scope and note.evidence.scope != "workspace":
                 row["scope"] = note.evidence.scope
             if note.supersedes:
                 row["supersedes"] = note.supersedes

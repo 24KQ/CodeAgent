@@ -129,7 +129,12 @@ class MemoryRetriever:
     ) -> None:
         self.store = store
         self.state = dict(state or {})
-        self.workspace_root = workspace_root
+        # 未显式传 workspace_root 时继承 store 的上下文（Codex P2 review #3）：
+        # 配置了 workspace_root 的 store 不应在检索时被"无上下文"重解析
+        # （fingerprint 比较会误判 scope_mismatch）。
+        self.workspace_root = (
+            workspace_root if workspace_root is not None else getattr(store, "workspace_root", None)
+        )
 
     def _iter_notes(self) -> Any:
         for note in self.state.get("episodic_notes", []):
@@ -153,17 +158,17 @@ class MemoryRetriever:
             recency = _parse_timestamp(note.get("created_at"))
             note_index = int(note.get("note_index", 0))
             # 排序以 tuple 键 (exact_tag, keyword_overlap, recency, note_index)
-            # 为准；score 是与排序键严格同向的审计值（Codex P2 review #8）：
-            # - keyword 分量封顶 99 个（990 < exact 1000），重叠再多也压不过
-            #   exact tag——与排序的 exact 绝对置前一致；
-            # - recency 用 1e12 归一化（epoch 秒 ~1.78e9 → ~0.0018），永不封顶，
-            #   现代时间戳之间也能拉开差异；
-            # - note_index 分量 1e9 归一化（笔记数远小于 1e9），保持单调。
+            # 为准；score 是与排序严格同向的可读审计值（Codex P2 review #8）：
+            # - exact 1000 > keyword 封顶 99 个 = 990（重叠再多也压不过 exact）；
+            # - keyword 单位 10 > recency 归一化全范围（~0.002，永不封顶，
+            #   现代时间戳之间可区分）；
+            # - 固定加权无法对 (recency, note_index) 保序嵌入（秒级 recency
+            #   差异 1e-12 恒小于任意 note_index 权重），因此 note_index 不进
+            #   score——它只作排序 tiebreak；同分条目的先后由排序键决定。
             score = (
                 exact_tag_match * 1000
                 + min(keyword_overlap, 99) * 10
                 + min(recency / 1_000_000_000_000, 0.999)
-                + min(note_index / 1_000_000_000, 0.001)
             )
             ranked.append(((exact_tag_match, keyword_overlap, recency, note_index), score, note))
         ranked.sort(key=lambda item: item[0], reverse=True)

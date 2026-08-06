@@ -55,8 +55,13 @@ def file_freshness(raw_path: str | Path, workspace_root: str | Path | None = Non
     return hashlib.sha256(resolved.read_bytes()).hexdigest()
 
 
-def compute_anchor_hash(path: str | Path) -> str | None:
+def compute_anchor_hash(path: str | Path | None) -> str | None:
     """证据锚点哈希：文件 sha256；缺失或超大（>10MB）返回 None。"""
+    # source_path_for_evidence 会对 workspace 外的绝对路径返回 None；这里
+    # 把“路径未通过 workspace 边界校验”作为无锚点处理，避免 Path(None)
+    # 抛出异常，也确保锚点计算不会绕过 provenance 的路径安全检查。
+    if path is None:
+        return None
     path = Path(path)
     if not path.exists() or not path.is_file():
         return None
@@ -84,12 +89,24 @@ def workspace_fingerprint(workspace_root: str | Path) -> str:
 
 
 def source_path_for_evidence(workspace_root: str | Path | None, source_path: str | None) -> Path | None:
-    """evidence source_path 落盘的是 workspace 相对路径，取哈希时还原为绝对路径。"""
+    """把 evidence source_path 还原为可哈希的绝对路径；越界返回 None。
+
+    相对路径按 workspace_root 拼接；绝对路径必须 resolve 在 workspace 内
+    （Codex P2 review #3：否则 anchor/staleness 可读取 workspace 外的任意
+    文件）。workspace_root 为 None 时不做限制（无 workspace 上下文的全局
+    模式）。
+    """
     if not source_path:
         return None
     path = Path(source_path)
     if path.is_absolute():
-        return path
+        if workspace_root is None:
+            return path
+        root = Path(workspace_root).resolve()
+        resolved = path.resolve()
+        if not (resolved == root or root in resolved.parents):
+            return None
+        return resolved
     if workspace_root is None:
         return path
     return Path(workspace_root) / path

@@ -239,6 +239,42 @@ def test_score_recency_monotonic_modern_timestamps() -> None:
     assert result.selected_notes[0].text == "new pytest note"
 
 
+def test_retriever_inherits_store_workspace(tmp_path: Path) -> None:
+    """未显式传 workspace_root 时，Retriever 应继承 store 的 workspace 上下文。"""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = DurableMemoryStore(workspace / ".firstcoder" / "memory", workspace_root=workspace)
+    store.promote([("key-decisions", "pytest workspace context")])
+
+    result = MemoryRetriever(store=store).retrieve(MemoryQuery(text="pytest"))
+
+    assert [note.text for note in result.selected_notes] == ["pytest workspace context"]
+    assert all(selection.reject_reason != "scope_mismatch" for selection in result.selections)
+
+
+def test_score_seconds_recency_beats_note_index() -> None:
+    """同等关键词重叠时，秒级 recency 差异必须压过极大的 note_index。"""
+    state = {
+        "episodic_notes": [
+            _state_note(
+                "old pytest note",
+                created_at="2026-08-06T00:00:00+00:00",
+                note_index=10_000_000,
+            ),
+            _state_note(
+                "new pytest note",
+                created_at="2026-08-06T00:00:01+00:00",
+                note_index=0,
+            ),
+        ]
+    }
+
+    result = _retriever(state).retrieve(MemoryQuery(text="pytest"))
+
+    assert [note.text for note in result.selected_notes] == ["new pytest note", "old pytest note"]
+    assert result.selections[0].score > result.selections[1].score
+
+
 def test_selections_globally_ranked() -> None:
     """selections 全局按 score 降序：高分 rejected（quarantine）排在低分 selected 前。"""
     state = {

@@ -7,17 +7,38 @@ quarantine gate, and the evidence sidecar for daily-log provenance.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from firstcoder.memory.durable import DurableMemoryStore, note_id_for
+from firstcoder.memory.logs import ensure_memory_dir
 from firstcoder.memory.models import MemoryEvidence, MemoryNote
 
 
 def _store(tmp_path: Path) -> DurableMemoryStore:
     return DurableMemoryStore(tmp_path / "memory")
+
+
+def _try_make_junction(link: Path, target: Path) -> bool:
+    """在 Windows 上创建 junction，供目录链接防护测试复用。
+
+    junction 不要求管理员权限，但只在 Windows 存在；非 Windows 或当前环境
+    无法创建时返回 False，由调用测试回退到 symlink 或 skip。
+    """
+    if os.name != "nt":
+        return False
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
 
 
 def test_note_id_deterministic_and_distinct() -> None:
@@ -228,7 +249,9 @@ def test_promote_commit_point_index_last(tmp_path: Path, monkeypatch) -> None:
     with pytest.raises(OSError):
         store.promote([("key-decisions", "Second note")])
 
-    # 提交点（index 版本）不变：读者看不到半发布状态。
+    # 提交点（index 版本）不变：新 topic 未被注册（对已注册 topic 的
+    # 内容更新是 recovery-on-read——下面 load_topic_notes 读到的新内容
+    # 正是该语义）。
     assert store.index_version() == old_version
     # topic 文件可能已含未注册写入——崩溃窗口，promote docstring 已记录，
     # 不是撕裂可见性（版本号才是读者校验的提交点）。
@@ -327,6 +350,31 @@ def test_promote_refuses_junction_topics_dir(tmp_path: Path) -> None:
         store.promote([("key-decisions", "x")])
 
 
+def test_append_daily_log_refuses_logs_junction(tmp_path: Path) -> None:
+    """logs 目录是 symlink/junction 时 standalone daily-log API 必须拒绝写入。
+
+    `_transaction()` 不包住 append_to_daily_log，因此必须直接覆盖 logs 目录的
+    预置链接；Windows junction 与普通 symlink 都验证同一个越界写防护契约。
+    """
+    memory_dir = tmp_path / "memory"
+    store = _store(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    ensure_memory_dir(memory_dir)
+    logs_dir = memory_dir / "logs"
+    logs_dir.rmdir()
+
+    linked = _try_make_junction(logs_dir, outside)
+    if not linked:
+        try:
+            logs_dir.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlink/junction creation not available on this host")
+
+    with pytest.raises(ValueError):
+        store.append_daily_log("must stay inside memory root")
+
+
 def test_metadata_write_failure_self_heals_on_read(tmp_path: Path, monkeypatch) -> None:
     """topic 写成功、metadata 写失败（崩溃窗口）→ 提交点（index 版本）不
     推进，持锁读取触发惰性回填自愈（Codex P2 review #1）。"""
@@ -344,7 +392,8 @@ def test_metadata_write_failure_self_heals_on_read(tmp_path: Path, monkeypatch) 
         store.promote([("key-decisions", "Second note")])
     monkeypatch.setattr(DurableMemoryStore, "_write_topic_metadata", real_write_metadata)
 
-    # 提交点未推进：新 topic 内容不可见（index 仍是旧版本）
+    # 提交点未推进：index 版本不变（已注册 topic 的内容更新是
+    # recovery-on-read——读取可见已写入的新内容）
     assert store.index_version() == old_version
     # 读取自愈：topic 文件里的新 note 得到完整 metadata 行
     notes = store.load_topic_notes("key-decisions")
@@ -384,6 +433,25 @@ def test_upsert_persists_scope(tmp_path: Path) -> None:
     assert rows[note_id_for("key-decisions", "pytest note")]["scope"] == "global"
 
 
+def test_upsert_default_scope_keeps_fingerprint(tmp_path: Path) -> None:
+    """默认 evidence scope 不得覆盖 store 生成的真实 workspace fingerprint。"""
+    from firstcoder.memory.provenance import workspace_fingerprint
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = DurableMemoryStore(workspace / ".firstcoder" / "memory", workspace_root=workspace)
+    note = MemoryNote(
+        topic="key-decisions",
+        text="default scope keeps workspace identity",
+        evidence=MemoryEvidence(),
+    )
+
+    store.upsert_topic(note)
+
+    row = store._load_topic_metadata("key-decisions")[note_id_for(note.topic, note.text)]
+    assert row["scope"] == workspace_fingerprint(workspace)
+
+
 def test_anchor_hash_auto_computed_from_source(tmp_path: Path) -> None:
     """source_path 存在且 anchor 缺失时按文件内容自动计算（Codex P2 review #8）。"""
     import hashlib
@@ -403,6 +471,55 @@ def test_anchor_hash_auto_computed_from_source(tmp_path: Path) -> None:
     assert rows[note_id_for("key-decisions", "pytest note")]["evidence"]["evidence_anchor_hash"] == (
         hashlib.sha256(b"def f(): return 1").hexdigest()
     )
+
+
+def test_backfill_persists_computed_anchor(tmp_path: Path) -> None:
+    """已有 metadata 缺 anchor 时，读取回填结果必须再次写回磁盘 sidecar。"""
+    workspace = tmp_path / "workspace"
+    source = workspace / "src" / "a.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("print('stable')", encoding="utf-8")
+    store = DurableMemoryStore(workspace / ".firstcoder" / "memory", workspace_root=workspace)
+    store.promote([("key-decisions", "anchor is recoverable")])
+
+    note_id = note_id_for("key-decisions", "anchor is recoverable")
+    metadata_path = store._metadata_path("key-decisions")
+    rows = store._load_topic_metadata("key-decisions")
+    rows[note_id]["evidence"] = {
+        "source_path": "src/a.py",
+        "session_id": "session-1",
+        "evidence_anchor_hash": None,
+    }
+    metadata_path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows.values()) + "\n",
+        encoding="utf-8",
+    )
+
+    store.load_topic_notes("key-decisions")
+
+    persisted = store._load_topic_metadata("key-decisions")[note_id]
+    assert persisted["evidence"]["evidence_anchor_hash"] == hashlib.sha256(
+        b"print('stable')"
+    ).hexdigest()
+
+
+def test_upsert_outside_absolute_source_no_anchor(tmp_path: Path) -> None:
+    """workspace 外绝对 source_path 不得被 anchor 计算读取。"""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("outside content", encoding="utf-8")
+    store = DurableMemoryStore(workspace / ".firstcoder" / "memory", workspace_root=workspace)
+    note = MemoryNote(
+        topic="key-decisions",
+        text="outside source is not evidence",
+        evidence=MemoryEvidence(source_path=str(outside), session_id="session-1"),
+    )
+
+    store.upsert_topic(note)
+
+    row = store._load_topic_metadata("key-decisions")[note_id_for(note.topic, note.text)]
+    assert row["evidence"].get("evidence_anchor_hash", "") == ""
 
 
 def test_topic_slug_normalizes_outer_whitespace(tmp_path: Path) -> None:
