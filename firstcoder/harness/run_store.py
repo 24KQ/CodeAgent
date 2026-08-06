@@ -79,13 +79,16 @@ class RunStore:
             resolved = candidate.resolve()
             if root not in resolved.parents:
                 raise ValueError(f"run dir {value!r} resolves outside the store root")
-        # 威胁模型边界（Codex re-review #4 正式接受）：本方法防御的是预置的
-        # 静态路径欺骗——恶意 run_id、store 内被预置的 symlink/junction
+        # 威胁模型边界（Codex re-review #4/#5 正式接受）：本方法防御的是
+        # 预置的静态路径欺骗——恶意 run_id、store 内被预置的 symlink/junction
         # 别名或逃逸。不防御"检查后、使用前"的并发路径替换（目录级 TOCTOU）：
         # 那要求攻击者能在 store root 内创建或替换目录条目，而 store root
         # 的写入者只有 agent 运行时与用户；能这么做的攻击者已可直接替换
         # store root 本身（root 无法自证），超出本类防御范围。文件级
-        # TOCTOU 由 `_open_no_follow`（O_NOFOLLOW）缩窗。
+        # TOCTOU 由 `_open_no_follow`（O_NOFOLLOW）缩窗。文件级 hardlink
+        # 亦不识别（is_symlink/O_NOFOLLOW 均不防 hardlink，两个 run 的
+        # trace 可经预置 hardlink 共享 inode）——同属"store 对不可信同用户
+        # 进程可写"模型之外的风险，记录于此、不单独防御。
         return candidate
 
     def task_state_path(self, run_id: object) -> Path:
