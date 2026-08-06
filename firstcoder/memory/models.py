@@ -18,6 +18,13 @@ RejectReason = Literal[
     "relative_date",
     "missing_evidence",
     "too_trivial",
+    # retrieval 实际产生的拒绝原因（Codex P2 review #8：契约声明
+    # 必须覆盖实现产生并写入 audit trail 的全部值）
+    "quarantined",
+    "superseded",
+    "stale_evidence",
+    "scope_mismatch",
+    "below_limit",
 ]
 
 
@@ -68,6 +75,7 @@ class RetrievalSelection:
     note: MemoryNote
     selected: bool = False
     reject_reason: RejectReason | None = None
+    score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -76,6 +84,7 @@ class RetrievalResult:
 
     query: MemoryQuery
     selections: list[RetrievalSelection] = field(default_factory=list)
+    query_hash: str = ""
 
     @property
     def selected_notes(self) -> list[MemoryNote]:

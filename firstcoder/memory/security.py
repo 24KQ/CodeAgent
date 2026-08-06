@@ -21,11 +21,13 @@ _KEYWORD = r"(?:key|token|secret|password|api)"
 _LONG_HEX = r"[A-Fa-f0-9]{32,}"
 _LONG_BASE64 = r"[A-Za-z0-9+/]{40,}={0,2}"
 
-#: Five secret shapes (pico memory_lint.py:13-23, verbatim).
-#: Known gap kept verbatim for regex-source sync: `sk-proj-...` keys (dash
-#: in the class) are not covered — revisit when wiring the data plane (P2).
+#: Five secret shapes (pico memory_lint.py:13-23, verbatim) plus the
+#: `sk-proj-...` class (Codex P2 review #10: the P0 comment noted the gap
+#: for the data-plane wiring, which is now live — `sk-proj-` OpenAI project
+#: keys must be caught before `promote` writes them).
 SECRET_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9]{20,}"),
+    re.compile(r"sk-proj-[A-Za-z0-9_-]{20,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"ghp_[A-Za-z0-9]{36,}"),
     re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),

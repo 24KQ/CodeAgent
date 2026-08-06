@@ -46,6 +46,18 @@ def test_should_quarantine_secret_shaped() -> None:
     assert should_quarantine("the key is sk-abcdefghijklmnopqrstuvwxyz0123")
 
 
+def test_should_quarantine_sk_proj_key() -> None:
+    """OpenAI project key（sk-proj- 前缀，P0 注释中的缺口，Codex P2 review #10）。"""
+    key = "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+    assert should_quarantine(f"the key is {key}")
+
+
+def test_sk_proj_pattern_matches_typical_key() -> None:
+    """sk-proj- 键带连字符，旧 `sk-[A-Za-z0-9]{20,}` 模式匹配不到，必须由新模式命中。"""
+    key = "sk-proj-abcdefghijklmnopqrstuvwxyz-0123456789-abcdef"
+    assert any(p.search(key) for p in SECRET_PATTERNS)
+
+
 def test_should_quarantine_clean_text() -> None:
     assert not should_quarantine("remember that the build needs cmake")
 
