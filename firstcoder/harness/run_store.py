@@ -20,7 +20,14 @@ from pathlib import Path
 
 from firstcoder.memory.write import atomic_write_bytes
 
-_RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+_RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]+\Z")
+
+#: Windows 保留名（含扩展名形式如 `CON.txt`），拒绝以避免写盘重定向到设备。
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
 
 
 class RunStore:
@@ -30,13 +37,31 @@ class RunStore:
 
     def _check_run_id(self, run_id: object) -> str:
         value = str(getattr(run_id, "run_id", run_id) or "")
-        # 字符集不含路径分隔符，所以唯一的逃逸风险是整体等于 "." / ".."。
-        if not _RUN_ID_PATTERN.match(value) or value in (".", ".."):
+        # fullmatch + \Z：字符集不含路径分隔符，且拒绝末尾换行的逃逸；
+        # 整体等于 "." / ".." 也拒绝。
+        if not _RUN_ID_PATTERN.fullmatch(value) or value in (".", ".."):
             raise ValueError(f"run id {value!r} is not a safe directory name")
+        # Windows 会静默剥离目录名末尾的点和空格，导致两个 id 指向同一目录。
+        if value.rstrip(". ") != value:
+            raise ValueError(f"run id {value!r} must not end with '.' or whitespace")
+        if value.split(".")[0].upper() in _WINDOWS_RESERVED_NAMES:
+            raise ValueError(f"run id {value!r} is a Windows reserved name")
         return value
 
     def run_dir(self, run_id: object) -> Path:
-        return self.root / self._check_run_id(run_id)
+        value = self._check_run_id(run_id)
+        candidate = self.root / value
+        if candidate.exists():
+            # 已存在的目录必须是 store root 内的真实路径：resolve() 解析
+            # symlink / junction 后做 containment 校验，防止 run 目录被
+            # 重定向到 root 之外。新建目录不检查（mkdir 不会跟随不存在的
+            # 链接；预置 symlink 的 TOCTOU 在 Windows 上需要特权，残留
+            # 风险在此处用注释记录）。
+            root = self.root.resolve()
+            resolved = candidate.resolve()
+            if not (resolved == root or root in resolved.parents):
+                raise ValueError(f"run dir {value!r} resolves outside the store root")
+        return candidate
 
     def task_state_path(self, run_id: object) -> Path:
         return self.run_dir(run_id) / "task_state.json"

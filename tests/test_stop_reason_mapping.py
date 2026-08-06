@@ -50,13 +50,46 @@ def test_completed_with_limit_finish_maps_reason() -> None:
     assert map_turn_outcome(status="completed", finish_reason="interrupted") == STOP_REASON_INTERRUPTED
 
 
-def test_waiting_for_user_input_is_approval_denied() -> None:
-    assert map_turn_outcome(status="waiting_for_user_input") == STOP_REASON_APPROVAL_DENIED
+def test_waiting_ask_user_is_not_terminal() -> None:
+    # ask_user 只是等待用户回答，不是终局（Codex P1 review fix）。
+    assert map_turn_outcome(status="waiting_for_user_input", wait_kind="ask_user") == ""
+
+
+def test_waiting_permission_pending_is_not_denied() -> None:
+    # 权限等待但用户尚未决定，不映射 approval_denied。
+    assert map_turn_outcome(
+        status="waiting_for_user_input", wait_kind="permission_confirmation"
+    ) == ""
+
+
+def test_waiting_permission_denied_is_approval_denied() -> None:
+    assert (
+        map_turn_outcome(
+            status="waiting_for_user_input",
+            wait_kind="permission_confirmation",
+            permission_denied=True,
+        )
+        == STOP_REASON_APPROVAL_DENIED
+    )
 
 
 def test_error_type_overrides_status() -> None:
     assert map_turn_outcome(status="completed", error_type="persistence") == STOP_REASON_PERSISTENCE_ERROR
     assert map_turn_outcome(status="completed", error_type="resume") == STOP_REASON_RESUME_LOAD_ERROR
+
+
+def test_error_type_provider_maps_model_error() -> None:
+    # 真实 provider 异常在 loop 直接抛出，接线层以 error_type="provider" 落到这里。
+    assert map_turn_outcome(status="failed", error_type="provider") == STOP_REASON_MODEL_ERROR
+
+
+def test_failed_status_maps_finish_reason() -> None:
+    # 失败路径也走 finish_reason 映射（Codex P1 review fix）：
+    # provider error / 超时等与 completed 状态无关。
+    assert map_turn_outcome(status="failed", finish_reason="error") == STOP_REASON_MODEL_ERROR
+    assert map_turn_outcome(status="failed", finish_reason="turn_timeout") == STOP_REASON_TOOL_TIMEOUT
+    assert map_turn_outcome(status="failed", finish_reason="interrupted") == STOP_REASON_INTERRUPTED
+    assert map_turn_outcome(status="failed", finish_reason="cancelled") == STOP_REASON_CANCELLED
 
 
 def test_unknown_status_maps_to_empty() -> None:

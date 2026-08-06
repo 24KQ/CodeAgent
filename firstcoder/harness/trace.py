@@ -126,6 +126,7 @@ class TraceWriter:
         )
         self._last_span_id = built["span_id"]
         self.run_store.append_trace(task_state, built)
+        critical_exc: Exception | None = None
         for consumer in self.consumers:
             try:
                 consumer.handle(task_state, built)
@@ -138,5 +139,12 @@ class TraceWriter:
                     "critical": bool(getattr(consumer, "critical", False)),
                 }
                 task_state.evidence_summaries.setdefault("runtime_consumer_errors", []).append(error)
+                if error["critical"]:
+                    # 审计硬失败：错误已记录进 evidence_summaries，先落盘
+                    # task_state 再中断 run（文档语义，Codex P1 review fix）。
+                    critical_exc = exc
+                    break
         self.run_store.write_task_state(task_state)
+        if critical_exc is not None:
+            raise critical_exc
         return built

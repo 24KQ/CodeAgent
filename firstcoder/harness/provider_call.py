@@ -54,7 +54,7 @@ class ProviderCallMetadata:
     protocol: str = ""
     base_url: str = ""
     request_at: str = ""
-    response_at: str = ""
+    response_at: str = ""  # P5 接线方必须用 trace.now_iso() 生成（UTC Z，Codex P1 review fix）
     finish_reason: str = ""
     usage: UsageSnapshot = field(default_factory=UsageSnapshot)
     prompt_estimated_tokens: int = 0

@@ -60,7 +60,26 @@ def test_artifacts_dir(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "bad",
-    ["", "../escape", "a/b", ".", "..", "run x", "run\\x", "run..x/.."],
+    [
+        "",
+        "../escape",
+        "a/b",
+        ".",
+        "..",
+        "run x",
+        "run\\x",
+        "run..x/..",
+        "run_abc\n",  # 末尾换行逃逸（fullmatch 拒绝，Codex P1 review fix）
+        "run_abc.",  # Windows 剥离末尾点 -> 与其他 id 撞目录
+        "run_abc ",
+        "CON",  # Windows 保留名
+        "con.txt",
+        "PRN",
+        "AUX",
+        "NUL",
+        "COM1",
+        "lpt9",
+    ],
 )
 def test_run_id_guard_rejects_unsafe_names(tmp_path: Path, bad: str) -> None:
     store = RunStore(tmp_path / "runs")
@@ -72,3 +91,17 @@ def test_run_id_guard_accepts_safe_names(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "runs")
     assert store.run_dir("run_20260806-121314-abc123") == tmp_path / "runs" / "run_20260806-121314-abc123"
     assert store.run_dir("task.a-1") == tmp_path / "runs" / "task.a-1"
+
+
+def test_run_dir_rejects_symlink_escape(tmp_path: Path) -> None:
+    """已存在的 run 目录若解析出 store root，必须拒绝（symlink/junction 逃逸）。"""
+    store = RunStore(tmp_path / "runs")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = tmp_path / "runs" / "run_evil"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation not permitted on this host")
+    with pytest.raises(ValueError):
+        store.run_dir("run_evil")

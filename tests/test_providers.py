@@ -745,6 +745,73 @@ def test_provider_usage_normalizes_to_shared_token_usage(provider_kind) -> None:
     assert response.usage == expected
 
 
+def test_openai_parse_usage_reads_cached_from_details_object() -> None:
+    """官方 SDK 的 prompt_tokens_details 是对象而非 dict（Codex P1 review fix）。"""
+    from firstcoder.providers.openai_compatible import _parse_usage
+
+    usage = _parse_usage(
+        _Object(
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+            prompt_tokens_details=_Object(cached_tokens=4),
+        )
+    )
+    assert usage.input_tokens == 10
+    assert usage.cached_input_tokens == 4
+
+
+class _FakeOpenAIUsageStreamCompletions:
+    def __init__(self):
+        self.last_params = None
+
+    def create(self, **params):
+        self.last_params = params
+        return iter(
+            [
+                _Object(model=params["model"], choices=[_Object(delta=_Object(content="hi"), finish_reason=None)]),
+                _Object(model=params["model"], choices=[_Object(delta={}, finish_reason="stop")]),
+                # usage 摘要 chunk：没有 choices，只有 usage（Codex P1 review fix）。
+                _Object(
+                    model=params["model"],
+                    usage=_Object(
+                        prompt_tokens=11,
+                        completion_tokens=7,
+                        total_tokens=18,
+                        prompt_tokens_details=_Object(cached_tokens=3),
+                    ),
+                ),
+            ]
+        )
+
+
+class _FakeOpenAIUsageStreamClient:
+    def __init__(self):
+        self.completions = _FakeOpenAIUsageStreamCompletions()
+        self.chat = _Object(completions=self.completions)
+
+
+def test_openai_compatible_provider_parses_streaming_usage() -> None:
+    async def collect_events():
+        client = _FakeOpenAIUsageStreamClient()
+        provider = OpenAICompatibleProvider(
+            name="test-openai",
+            model="test-model",
+            api_key="test-key",
+            client=client,
+        )
+        events = [event async for event in provider.astream(ChatRequest(messages=[ChatMessage(role="user", content="hi")]))]
+        return client, events
+
+    client, events = asyncio.run(collect_events())
+    assert client.completions.last_params["stream_options"] == {"include_usage": True}
+    completed = events[-1]
+    assert completed.kind == "message_completed"
+    assert completed.response.usage == TokenUsage(
+        input_tokens=11, output_tokens=7, total_tokens=18, cached_input_tokens=3
+    )
+
+
 def test_openai_compatible_provider_parses_tool_calls():
     client = _FakeOpenAIClient()
     provider = OpenAICompatibleProvider(

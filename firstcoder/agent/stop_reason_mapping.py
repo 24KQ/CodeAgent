@@ -10,8 +10,9 @@
 - tool round / provider call limit -> step_limit_reached（保留原始原因）
 - turn timeout -> tool_timeout
 - interrupted / cancelled -> interrupted / cancelled（pico 枚举扩展）
-- provider 不支持合成响应（finish_reason="error"）-> model_error
-- waiting for user input（权限等待）-> approval_denied
+- provider 不支持合成响应 / provider 异常（finish_reason="error" 或 error_type="provider"）-> model_error
+- 用户输入等待：只有权限确认的最终结果是明确拒绝才 -> approval_denied；
+  ask_user 与等待决定中都不映射（非终局，Codex P1 review fix）
 - persistence / resume 失败 -> persistence_error / resume_load_error
 """
 
@@ -59,20 +60,34 @@ def map_turn_outcome(
     status: str,
     finish_reason: str | None = None,
     error_type: str = "",
+    wait_kind: str = "",
+    permission_denied: bool = False,
 ) -> str:
     """把一轮 loop 的结果映射为 STOP_REASON_*（§7.3 映射表）。
 
-    `error_type` 是接线层传入的失败分类（"persistence" / "resume"）。
+    `error_type` 是接线层传入的失败分类（"persistence" / "resume" /
+    "provider"）。`wait_kind` 区分 user_input 的两种等待（"ask_user" /
+    "permission_confirmation"）；`permission_denied` 表示权限确认的最终
+    结果是拒绝——只有明确拒绝才映射 approval_denied，等待用户决定不算
+    终局（Codex P1 review fix）。
+
+    失败路径也走 finish_reason 映射（不限于 completed 状态）：真实
+    provider 异常在 loop 里直接抛出，P5 接线时以 error_type="provider"
+    或 finish_reason="error" 落到这里。
     """
     if error_type == "persistence":
         return STOP_REASON_PERSISTENCE_ERROR
     if error_type == "resume":
         return STOP_REASON_RESUME_LOAD_ERROR
+    if error_type == "provider":
+        return STOP_REASON_MODEL_ERROR
     if status == AgentTurnStatus.WAITING_FOR_USER_INPUT.value:
-        return STOP_REASON_APPROVAL_DENIED
+        if wait_kind == "permission_confirmation" and permission_denied:
+            return STOP_REASON_APPROVAL_DENIED
+        return ""
+    mapped = map_finish_reason(finish_reason)
+    if mapped:
+        return mapped
     if status == AgentTurnStatus.COMPLETED.value:
-        mapped = map_finish_reason(finish_reason)
-        if mapped:
-            return mapped
         return STOP_REASON_FINAL_ANSWER_RETURNED
     return ""

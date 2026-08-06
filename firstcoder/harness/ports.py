@@ -29,7 +29,13 @@ class RunReportSink(Protocol):
 
 
 class Redactor(Protocol):
-    """Redact secrets from text and artifacts before persistence (fusion H3/M8)."""
+    """Redact secrets from text and artifacts before persistence (fusion H3/M8).
+
+    Aligned with the actual recursive interface of
+    `memory.security.StaticSecurityPolicy` (Codex P1 review fix): `redact`
+    handles plain text; `redact_artifact` recursively redacts any value,
+    which is what `TraceWriter.emit` calls before persistence.
+    """
 
     def redact(self, text: str) -> str: ...
-    def redact_artifact(self, path: str, content: bytes) -> bytes: ...
+    def redact_artifact(self, value: Any, key: str | None = None) -> Any: ...
