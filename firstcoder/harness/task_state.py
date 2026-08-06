@@ -58,6 +58,9 @@ class TaskState:
     artifact_graph: dict = field(default_factory=dict)
     evidence_summaries: dict = field(default_factory=dict)
     verifier_suggestions: list = field(default_factory=list)
+    # P4 readiness 读取这两类运行时证据；P5 的 runtime consumers 负责持续填充。
+    runtime_reminders: list = field(default_factory=list)
+    todo_changes: list = field(default_factory=list)
 
     @classmethod
     def create(
@@ -103,6 +106,8 @@ class TaskState:
             artifact_graph=dict(data.get("artifact_graph", {}) or {}),
             evidence_summaries=dict(data.get("evidence_summaries", {}) or {}),
             verifier_suggestions=list(data.get("verifier_suggestions", []) or []),
+            runtime_reminders=list(data.get("runtime_reminders", []) or []),
+            todo_changes=list(data.get("todo_changes", []) or []),
         )
 
     def record_attempt(self) -> "TaskState":
@@ -156,4 +161,6 @@ class TaskState:
             "artifact_graph": dict(self.artifact_graph),
             "evidence_summaries": dict(self.evidence_summaries),
             "verifier_suggestions": list(self.verifier_suggestions),
+            "runtime_reminders": list(self.runtime_reminders),
+            "todo_changes": list(self.todo_changes),
         }

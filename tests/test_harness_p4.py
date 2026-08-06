@@ -17,7 +17,10 @@ from firstcoder.harness.experiments.context_cost import (
     summarize_paired_rows,
     write_experiment_artifacts,
 )
-from firstcoder.harness.final_readiness import evaluate_final_readiness
+from firstcoder.harness.final_readiness import (
+    evaluate_final_readiness,
+    extract_required_artifact_paths,
+)
 from firstcoder.harness.report import build_report
 from firstcoder.harness.task_state import TaskState
 from firstcoder.harness.verification import (
@@ -149,6 +152,18 @@ def test_final_readiness_soft_reminder_is_deduplicated() -> None:
     assert second["reminder_already_sent"] is True
 
 
+def test_final_readiness_reads_persisted_runtime_reminder_and_todo_state() -> None:
+    state = TaskState.create("task-1", "继续工作")
+    state.runtime_reminders.append({"status": "partial_success", "workspace_changed": True})
+    state.todo_changes.append(
+        {"todo": {"id": "todo-1", "priority": "high", "status": "in_progress"}}
+    )
+    decision = evaluate_final_readiness(state, mode="strict")
+    assert "partial_success_workspace_changed" in decision["reasons"]
+    assert "unresolved_high_priority_todo" in decision["reasons"]
+    assert decision["decision"] == "block"
+
+
 def test_context_pressure_uses_actual_only_for_matching_identity() -> None:
     controller = ContextPressureController()
     pressure = controller.evaluate(
@@ -194,6 +209,25 @@ def test_context_budget_summary_tracks_reductions() -> None:
     assert summary["effective_window"] == 900
     assert summary["saved_chars"] == 80
     assert summary["provider_usage_available"] is True
+
+    configured = context_budget_summary(
+        {
+            "context_usage": {
+                "context_window": 1000,
+                "reserved_output_tokens": 100,
+                "budget_tokens": 500,
+                "total_estimated_tokens": 450,
+            }
+        }
+    )
+    assert configured["effective_window"] == 500
+    assert configured["pressure_ratio"] == 0.9
+
+
+def test_required_artifact_extraction_rejects_inputs_and_parent_paths() -> None:
+    assert extract_required_artifact_paths("输入 `a.txt`，输出 `b.json`") == ["b.json"]
+    assert extract_required_artifact_paths("生成 `../outside.json`") == []
+    assert extract_required_artifact_paths("生成 `Dockerfile`") == ["Dockerfile"]
 
 
 def test_context_cost_extracts_actual_usage_and_writes_artifacts(tmp_path: Path) -> None:

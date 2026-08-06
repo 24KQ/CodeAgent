@@ -21,7 +21,10 @@ def context_budget_summary(metadata: dict[str, Any] | None) -> dict[str, Any]:
     history = dict(metadata.get("history", {}) or {})
     window = int(usage.get("context_window", 0) or 0)
     reserved = int(usage.get("reserved_output_tokens", 0) or 0)
-    effective_window = max(0, window - reserved)
+    # C3 的 pressure_ratio 以 ContextPressureController 的 budget_tokens 为准；
+    # 尚未接入校准生产者的旧 metadata 才回退到 window-output reserve。
+    configured_budget = int(usage.get("budget_tokens", 0) or 0)
+    effective_window = configured_budget or max(0, window - reserved)
     estimated_tokens = int(usage.get("total_estimated_tokens", 0) or 0)
     reductions = [
         *[_section_reduction(item) for item in metadata.get("budget_reductions", []) or []],
@@ -35,7 +38,7 @@ def context_budget_summary(metadata: dict[str, Any] | None) -> dict[str, Any]:
         "estimated_tokens": estimated_tokens,
         "effective_window": effective_window,
         "reserved_output_tokens": reserved,
-        "pressure_ratio": round(estimated_tokens / effective_window, 4) if effective_window else 0,
+        "pressure_ratio": round(estimated_tokens / effective_window, 4) if effective_window else (1.0 if estimated_tokens else 0),
         "reductions": reductions,
         "pressure_tier": orchestrator.get("pressure_tier") or usage.get("pressure_tier", ""),
         "usage_source": orchestrator.get("usage_source") or usage.get("usage_source", ""),
@@ -56,7 +59,7 @@ def context_budget_summary(metadata: dict[str, Any] | None) -> dict[str, Any]:
         "replacement_ledger_enabled": bool(orchestrator.get("replacement_ledger_enabled", False)),
         "saved_chars": _saved_chars(metadata, history, orchestrator),
         "cached_tokens": int(usage.get("cached_tokens", usage.get("cached_input_tokens", 0)) or 0),
-        "prompt_changed_by_phase_3": False,
+        "prompt_changed_by_phase_3": bool(metadata.get("prompt_changed_by_phase_3", False)),
     }
 
 

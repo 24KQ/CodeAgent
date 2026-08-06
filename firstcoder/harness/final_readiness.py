@@ -1,6 +1,6 @@
 """Final-answer readiness gate over FirstCoder run evidence.
 
-gate 是一个纯决策层：它读取 TaskState 已经持久化的 changed paths、verification、
+gate 是一个决策层：它读取 TaskState 已经持久化的 changed paths、verification、
 governance 和 context summaries，返回 allow/warn/remind/block 决策；它不执行命令、
 不修改工作区，也不直接改变 AgentLoop。严格模式的 hard reason 可由接线层映射到
 ``final_gate_blocked``，而 warn/soft 模式只提供可审计提示。
@@ -39,7 +39,7 @@ READINESS_REASONS = {
 }
 
 _BACKTICK_RE = re.compile(r"`([^`]+)`")
-_OUTPUT_MARKERS = ("产出", "产物", "生成", "创建", "写入", "保存", "output", "artifact", "create", "write", "produce")
+_OUTPUT_MARKERS = ("产出", "产物", "生成", "创建", "写入", "保存", "输出", "output", "artifact", "create", "write", "produce")
 _INPUT_MARKERS = ("输入文件", "input file", "input files")
 _NON_OUTPUT_MARKERS = ("约束", "评分", "评估", "constraints", "scoring", "evaluation")
 _NEGATED_MARKERS = ("do not create", "don't create", "do not write", "don't write", "do not modify", "don't modify", "不要创建", "不要生成", "不要写入", "不要修改", "不创建", "不生成", "不修改")
@@ -64,6 +64,7 @@ _FILE_SUFFIXES = frozenset(
         ".yml",
     ]
 )
+_KNOWN_FILE_NAMES = frozenset({"dockerfile", "makefile", "license", "readme", ".gitignore", ".gitattributes"})
 
 
 def evaluate_final_readiness(
@@ -203,7 +204,8 @@ def extract_required_artifact_paths(text: str, workspace_root: str | Path | None
     for raw_line in str(text or "").splitlines():
         line = raw_line.strip()
         lowered = line.lower()
-        if any(marker in lowered for marker in _INPUT_MARKERS) or _starts_non_output_section(line, lowered):
+        input_marker_index = _first_marker_index(lowered, _INPUT_MARKERS)
+        if input_marker_index >= 0 or _starts_non_output_section(line, lowered):
             output_context = False
             output_dir = ""
         if any(marker in lowered for marker in _NEGATED_MARKERS):
@@ -215,13 +217,13 @@ def extract_required_artifact_paths(text: str, workspace_root: str | Path | None
         for match in _BACKTICK_RE.finditer(line):
             token = match.group(1).strip()
             normalized = _normalize_declared_path(token, root)
-            if normalized and _looks_like_directory(token) and _line_declares_output_dir(line) and _token_has_output_scope(output_context, marker_index, match.start()):
+            if normalized and _looks_like_directory(token) and _line_declares_output_dir(line) and _token_has_output_scope(output_context, marker_index, input_marker_index, match.start()):
                 line_output_dir = normalized
                 output_dir = normalized
         for match in _BACKTICK_RE.finditer(line):
             token = match.group(1).strip()
             normalized = _normalize_declared_path(token, root)
-            if not normalized or _looks_like_directory(token) or not _token_has_output_scope(output_context, marker_index, match.start()):
+            if not normalized or _looks_like_directory(token) or not _token_has_output_scope(output_context, marker_index, input_marker_index, match.start()):
                 continue
             candidate = normalized
             if line_output_dir and "/" not in candidate and "\\" not in candidate:
@@ -323,12 +325,18 @@ def _normalize_declared_path(token: str, root: Path | None) -> str:
             return str(path.resolve().relative_to(root)).replace("\\", "/")
         except ValueError:
             return ""
-    return value.lstrip("./").replace("\\", "/")
+    normalized = value.replace("\\", "/")
+    if normalized in {"", ".", ".."} or any(part == ".." for part in normalized.split("/")):
+        return ""
+    return normalized.removeprefix("./")
 
 
 def _looks_like_directory(token: str) -> bool:
     value = str(token or "").strip()
-    return value.endswith(("/", "\\")) or Path(value).suffix.lower() not in _FILE_SUFFIXES
+    name = value.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return value.endswith(("/", "\\")) or (
+        name not in _KNOWN_FILE_NAMES and Path(value).suffix.lower() not in _FILE_SUFFIXES
+    )
 
 
 def _line_declares_output_dir(line: str) -> bool:
@@ -346,5 +354,18 @@ def _first_marker_index(line: str, markers: tuple[str, ...]) -> int:
     return min(positions) if positions else -1
 
 
-def _token_has_output_scope(output_context: bool, marker_index: int, token_start: int) -> bool:
+def _token_has_output_scope(
+    output_context: bool,
+    marker_index: int,
+    input_marker_index: int,
+    token_start: int,
+) -> bool:
+    # “输入后输出”允许 marker 之后的新产物；“输出后输入”则截断输入段，
+    # 防止同一行的输入文件被误当成 required artifact。
+    if (
+        input_marker_index >= 0
+        and (marker_index < 0 or input_marker_index > marker_index)
+        and token_start >= input_marker_index
+    ):
+        return False
     return token_start >= marker_index if marker_index >= 0 else output_context
