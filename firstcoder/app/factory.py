@@ -11,6 +11,7 @@ from firstcoder.app.commands import ContextCommandHandler
 from firstcoder.app.help_commands import HelpCommandHandler
 from firstcoder.app.mcp_commands import McpCommandHandler
 from firstcoder.app.model_commands import ModelCommandHandler, ModelState
+from firstcoder.app.memory_commands import MemoryCommandHandler
 from firstcoder.app.model_state import ModelSelectionState, ModelStateStore
 from firstcoder.app.permission_commands import PermissionCommandHandler
 from firstcoder.app.router import CompositeCommandHandler
@@ -251,6 +252,7 @@ def create_firstcoder_app(
             ModelCommandHandler(model_switcher),
             session_handler,
             context_handler,
+            MemoryCommandHandler(session=current),
             permission_handler,
             skill_handler,
         ]

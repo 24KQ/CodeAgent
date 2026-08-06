@@ -34,6 +34,7 @@ from firstcoder.context.manager import ContextCompactRequest, ContextWindowTrigg
 from firstcoder.context.token_budget import ContextBudget, build_context_budget
 from firstcoder.context.task_boundary import TaskBoundaryService
 from firstcoder.input.attachments import UserAttachment
+from firstcoder.memory.prompt import extract_memory_tags
 from firstcoder.permissions.types import PermissionDecision, PermissionDecisionKind, PermissionRequest
 from firstcoder.providers.base import ChatProvider
 from firstcoder.providers.errors import ProviderError, ProviderErrorKind
@@ -726,7 +727,17 @@ class AgentLoop:
         return AgentTurnResult(status=AgentTurnStatus.WAITING_FOR_USER_INPUT, pending_input=pending_input)
 
     def _complete_turn(self, response: ChatResponse) -> AgentTurnResult:
+        """落库最终 response，并只从正常最终回答提取 memory tags。
+
+        ``_complete_turn`` 也会接收中断、超时、provider/工具轮次上限等合成
+        response。它们是执行状态说明，不是用户确认过的知识，必须禁止写入
+        durable memory；否则 guardrail 文本可能污染跨 session 记忆。
+        """
+
         self.session.append_assistant_response(response)
+        if _is_normal_memory_capture_response(response):
+            for entry in extract_memory_tags(response.content):
+                self.session.memory_runtime.record(entry, source="final_answer")
         return AgentTurnResult(status=AgentTurnStatus.COMPLETED, response=response)
 
     def _continue_tool_loop_from_response(
@@ -894,6 +905,7 @@ class AgentLoop:
         messages = self._request_messages(
             view=view,
             runtime_instruction=runtime_instruction,
+            record_memory_event=True,
         )
         request = self._main_chat_request(messages, definitions, tool_choice)
         return PreparedMainRequest(
@@ -995,7 +1007,33 @@ class AgentLoop:
             store_root=self.session.store.root,
         )
 
-    def _request_messages(self, *, view=None, runtime_instruction: str | None = None):
+    def _request_messages(
+        self,
+        *,
+        view=None,
+        runtime_instruction: str | None = None,
+        record_memory_event: bool = False,
+    ):
+        return self._request_messages_with_options(
+            view=view,
+            runtime_instruction=runtime_instruction,
+            record_memory_event=record_memory_event,
+        )
+
+    def _request_messages_with_options(
+        self,
+        *,
+        view=None,
+        runtime_instruction: str | None = None,
+        record_memory_event: bool = False,
+    ):
+        """构造动态 provider messages；memory 只在这里接入，不改变 stable prefix。
+
+        ``_context_budget_for_view`` 和真实请求都会调用这个函数，因此动态 memory
+        字符会自然计入现有 ``build_context_budget``。audit 只由真实请求开启，
+        避免同一轮的预算试算被记录成多次 retrieval。
+        """
+
         resolved_view = view or self.session.rebuild_view()
         system_prefix = self.session.build_system_prefix(
             provider_name=self.provider.name,
@@ -1015,6 +1053,12 @@ class AgentLoop:
                     content=render_current_task_plan_snapshot(resolved_view.task_plan),
                 ),
             ]
+        memory_message = self.session.memory_projector.build_message(
+            _memory_query_from_view(resolved_view),
+            record_audit=record_memory_event,
+        )
+        if memory_message is not None:
+            system_prefix = [*system_prefix, memory_message]
         return self._build_provider_messages(
             resolved_view,
             system_prefix=system_prefix,
@@ -1244,3 +1288,38 @@ class _AgentLoopLimitReached(Exception):
     def __init__(self, reason: AgentLoopStopReason) -> None:
         super().__init__(reason.value)
         self.reason = reason
+
+
+def _memory_query_from_view(view) -> str:
+    """从最新 user message 提取检索词，不把内部 basis id 注入 query。"""
+
+    for message in reversed(view.messages):
+        if message.role != "user":
+            continue
+        return "\n".join(
+            part.content
+            for part in message.parts
+            if part.kind == "text" and part.content
+        ).strip()
+    return ""
+
+
+def _is_normal_memory_capture_response(response: ChatResponse) -> bool:
+    """判断 response 是否真的是可从中提取用户记忆的正常最终回答。
+
+    finish_reason 覆盖 loop 的三类 limit、interrupted 和等待用户输入；raw
+    则覆盖权限确认/拒绝等合成状态。普通 provider 的 ``stop`` 和旧 fake
+    provider 常用的 ``None`` 都允许继续走标签提取。
+    """
+
+    if response.tool_calls:
+        return False
+    if response.finish_reason not in {None, "stop"}:
+        return False
+    raw = response.raw
+    if not isinstance(raw, dict):
+        return True
+    if raw.get("interrupted") or raw.get("requires_user_input") or raw.get("permission_denied"):
+        return False
+    request_type = str(raw.get("request_type") or "").lower()
+    return not request_type.startswith("permission")

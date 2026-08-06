@@ -97,6 +97,25 @@ class SessionEventWriter:
             },
         )
 
+    def append_memory_recorded(self, *, payload: Mapping[str, Any] | None = None, **metadata: Any) -> None:
+        """追加 memory 写入审计事件，但不创建普通会话消息。
+
+        memory 是 durable 旁路数据，不属于 provider 对话事实；因此这里使用独立
+        事件类型，``JsonlSessionStore`` 会在重放 SessionView 时静默忽略它。payload
+        由 memory runtime 在写入前脱敏，writer 本身不接收原始记忆正文。
+        """
+
+        event_payload = dict(payload or {})
+        event_payload.update(metadata)
+        self.append_event("memory_recorded", event_payload)
+
+    def append_memory_retrieved(self, *, payload: Mapping[str, Any] | None = None, **metadata: Any) -> None:
+        """追加 memory 检索审计事件，不污染 session history/tool sequence。"""
+
+        event_payload = dict(payload or {})
+        event_payload.update(metadata)
+        self.append_event("memory_retrieved", event_payload)
+
     def append_user_message(
         self,
         content: str,

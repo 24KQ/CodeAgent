@@ -10,10 +10,13 @@ from firstcoder.context.runtime_state import SessionRuntimeState
 from firstcoder.context.store import JsonlSessionStore
 from firstcoder.context.writer import SessionEventWriter
 from firstcoder.context.task_boundary import TaskBoundaryPolicy, TaskBoundaryService
+from firstcoder.memory.runtime import MemoryRuntime
 from firstcoder.permissions.manager import PermissionManager
 from firstcoder.planning.service import TaskPlanService
 from firstcoder.skills.models import SkillCatalog
 from firstcoder.tools.load_skill import create_load_skill_tool
+from firstcoder.tools.memory_note import create_memory_note_tool
+from firstcoder.tools.memory_promote import create_memory_promote_tool
 from firstcoder.tools.permission_registry import PermissionAwareToolRegistry
 from firstcoder.tools.retrieve_archive import create_retrieve_archive_tool
 from firstcoder.tools.registry import ToolRegistry
@@ -53,6 +56,7 @@ def create_session_tool_registry(
     store: JsonlSessionStore | None = None,
     writer: SessionEventWriter | None = None,
     skill_catalog: SkillCatalog | None = None,
+    memory_runtime: MemoryRuntime | None = None,
 ) -> ToolRegistryLike:
     """创建单个会话专用的工具注册表。
 
@@ -74,6 +78,8 @@ def create_session_tool_registry(
         "task_revise",
         "task_list",
         "load_skill",
+        "memory_note",
+        "memory_promote",
     }
     conflicting = next((tool.name for tool in supplied_tools if tool.name in reserved_names), None)
     if conflicting is not None:
@@ -98,6 +104,11 @@ def create_session_tool_registry(
             create_load_skill_tool(skill_catalog or SkillCatalog(), writer),
         ):
             registry.register(tool)
+    if memory_runtime is not None:
+        # memory tools 必须绑定当前 session 的 runtime，不能进入 builtin registry，
+        # 否则没有 workspace/session 边界的全局工具会把记忆写到错误项目。
+        registry.register(create_memory_note_tool(memory_runtime))
+        registry.register(create_memory_promote_tool(memory_runtime))
     if archive_root is not None:
         registry.register(
             create_retrieve_archive_tool(

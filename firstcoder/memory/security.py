@@ -36,6 +36,11 @@ SECRET_PATTERNS = [
     ),
 ]
 
+# 最后一条模式只在文本同时出现 secret 关键词时才有可能命中。先做这个
+# cheap pre-check，避免在超长普通字符串上让“关键词 + 长 base64”组合模式
+# 反复回溯；这不改变命中语义，只把无关输入快速排除。
+_SECRET_CONTEXT_PATTERN = re.compile(r"(?i)(?:key|token|secret|password|api)")
+
 #: Relative-date phrases that make a note decay (pico memory_lint.py:25).
 RELATIVE_DATE_PATTERN = re.compile(
     r"(?i)\b(tomorrow|yesterday|next week|last week)\b|今天|明天|昨天|下周|上周"
@@ -55,9 +60,11 @@ SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
 def should_quarantine(text: str) -> bool:
     """True when text carries a quarantine signature or looks secret-shaped."""
     text = str(text)
-    return bool(QUARANTINE_PATTERN.search(text)) or any(
-        pattern.search(text) for pattern in SECRET_PATTERNS
-    )
+    if QUARANTINE_PATTERN.search(text):
+        return True
+    if any(pattern.search(text) for pattern in SECRET_PATTERNS[:-1]):
+        return True
+    return bool(_SECRET_CONTEXT_PATTERN.search(text) and SECRET_PATTERNS[-1].search(text))
 
 
 def looks_sensitive_env_name(name: str) -> bool:
@@ -94,8 +101,10 @@ class StaticSecurityPolicy:
         text = str(text)
         for _, value in sorted(self.detected_secret_env_items(), key=lambda item: len(item[1]), reverse=True):
             text = text.replace(value, REDACTED_VALUE)
-        for pattern in SECRET_PATTERNS:
+        for pattern in SECRET_PATTERNS[:-1]:
             text = pattern.sub(REDACTED_VALUE, text)
+        if _SECRET_CONTEXT_PATTERN.search(text):
+            text = SECRET_PATTERNS[-1].sub(REDACTED_VALUE, text)
         return text
 
     def redact_artifact(self, value: object, key: str | None = None) -> object:
