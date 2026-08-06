@@ -392,7 +392,12 @@ def _parse_usage(usage: Any):
     input_tokens = _read_field(usage, "prompt_tokens")
     output_tokens = _read_field(usage, "completion_tokens")
     total_tokens = _read_field(usage, "total_tokens")
-    return token_usage(input_tokens, output_tokens, total_tokens)
+    cached = _read_field(usage, "cached_tokens")
+    if cached is None:
+        details = _read_field(usage, "prompt_tokens_details")
+        if isinstance(details, dict):
+            cached = details.get("cached_tokens")
+    return token_usage(input_tokens, output_tokens, total_tokens, cached)
 
 
 def _to_openai_tool_choice(tool_choice: ToolChoice | None) -> str | dict[str, Any] | None:

@@ -41,12 +41,23 @@ def token_usage(
     input_tokens: int | None,
     output_tokens: int | None,
     total_tokens: int | None = None,
+    cached_input_tokens: int | None = None,
 ) -> TokenUsage | None:
     if total_tokens is None and input_tokens is not None and output_tokens is not None:
         total_tokens = int(input_tokens) + int(output_tokens)
-    if input_tokens is None and output_tokens is None and total_tokens is None:
+    if (
+        input_tokens is None
+        and output_tokens is None
+        and total_tokens is None
+        and cached_input_tokens is None
+    ):
         return None
-    return TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens)
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        cached_input_tokens=cached_input_tokens,
+    )
 
 
 def merge_usage(left: TokenUsage | None, right: TokenUsage | None) -> TokenUsage | None:
@@ -56,6 +67,7 @@ def merge_usage(left: TokenUsage | None, right: TokenUsage | None) -> TokenUsage
         right.input_tokens if right.input_tokens is not None else left.input_tokens,
         right.output_tokens if right.output_tokens is not None else left.output_tokens,
         right.total_tokens if right.total_tokens is not None else left.total_tokens,
+        right.cached_input_tokens if right.cached_input_tokens is not None else left.cached_input_tokens,
     )
 
 
