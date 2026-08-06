@@ -20,6 +20,7 @@ from firstcoder.providers.types import ChatMessage
 MAX_MEMORY_INDEX_CHARS = 10_000
 DEFAULT_MEMORY_NOTE_LIMIT = 5
 DEFAULT_MEMORY_CHAR_LIMIT = 6_000
+_REDACTION_LOOKAHEAD_CHARS = 256
 _OMITTED = "\n[其余记忆已按预算省略]"
 
 
@@ -41,16 +42,20 @@ def load_memory_index_text(
     if not path.is_file():
         return ""
     try:
-        # 先截断再做正则脱敏，防止一个异常膨胀的 legacy index 让 secret
-        # pattern 在无关的超长字符上进行昂贵回溯；返回值仍会再次受预算保护。
-        text = path.read_text(encoding="utf-8", errors="replace")[:max_chars]
+        redactor = security or MemoryRedactor()
+        # 读取预算外的一小段 lookahead，覆盖 static secret pattern 的最长前置
+        # 关系；环境变量值则按实际长度扩展窗口，避免 secret 恰好跨越边界时
+        # 被截成无法匹配的片段。真正返回前仍会严格裁剪到 max_chars。
+        env_value_lengths = [len(value) for _, value in redactor.detected_secret_env_items()]
+        read_limit = max_chars + max(_REDACTION_LOOKAHEAD_CHARS, max(env_value_lengths, default=0))
+        text = path.read_text(encoding="utf-8", errors="replace")[:read_limit]
     except OSError:
         return ""
     if not any(line.lstrip().startswith("- [") for line in text.splitlines()):
         return ""
     # 即使调用方没有显式传策略，读侧也必须默认启用脱敏，避免 legacy
     # MEMORY.md 中残留的 secret 直接进入 prompt 或 /memory 输出。
-    redactor = security or MemoryRedactor()
+    # 必须先脱敏再裁剪；否则跨 max_chars 边界的 secret 可能只剩一段无效前缀。
     redacted = redactor.redact_text(text)
     return redacted[:max_chars]
 

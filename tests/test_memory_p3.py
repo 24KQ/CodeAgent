@@ -11,11 +11,11 @@ from pathlib import Path
 
 from firstcoder.agent.loop import AgentLoop
 from firstcoder.agent.session import AgentSession
-from firstcoder.app.memory_commands import MemoryCommandHandler
+from firstcoder.app.memory_commands import MemoryCommandHandler, _split_promote_syntax
 from firstcoder.app.runtime import CurrentSessionState
 from firstcoder.context.store import JsonlSessionStore
 from firstcoder.memory.durable import DurableMemoryStore
-from firstcoder.memory.logs import daily_log_path
+from firstcoder.memory.logs import daily_log_path, ensure_memory_dir
 from firstcoder.memory.prompt import (
     MAX_MEMORY_INDEX_CHARS,
     MemoryProjector,
@@ -69,6 +69,35 @@ def test_memory_runtime_does_not_promote_short_env_secret(tmp_path: Path, monkey
     assert receipt.ok is False
     assert receipt.quarantined is True
     assert load_memory_index_text(runtime.store.root) == ""
+
+
+def test_memory_redacts_before_entry_limit(tmp_path: Path) -> None:
+    secret = "sk-" + "A" * 40
+    runtime = _memory_runtime(tmp_path)
+
+    receipt = runtime.record("x" * (runtime.max_entry_chars - 10) + secret, source="test")
+
+    log_text = daily_log_path(runtime.store.root).read_text(encoding="utf-8")
+    assert receipt.redacted is True
+    assert secret not in log_text
+    assert "<redacted>" in log_text
+
+
+def test_memory_redacts_before_index_limit(tmp_path: Path) -> None:
+    secret = "sk-" + "B" * 40
+    runtime = _memory_runtime(tmp_path)
+    max_chars = 100
+    prefix = "- [topic](topics/topic.md): "
+    ensure_memory_dir(runtime.store.root)
+    runtime.store.index_path.write_text(
+        prefix + "x" * (max_chars - len(prefix) - 10) + secret,
+        encoding="utf-8",
+    )
+
+    index = load_memory_index_text(runtime.store.root, max_chars=max_chars)
+
+    assert secret not in index
+    assert "<redacted>" in index
 
 
 def test_memory_runtime_normalizes_multiline_promotion_receipt(tmp_path: Path) -> None:
@@ -141,6 +170,30 @@ def test_memory_commands_close_capture_promote_and_retrieve_loop(tmp_path: Path)
     assert "memory_retrieved" in event_types
     # memory audit 是旁路事件，不能投影成 user/assistant/tool 消息。
     assert session.rebuild_view().messages == []
+
+
+def test_remember_parser_preserves_ambiguous_natural_language(tmp_path: Path) -> None:
+    session = AgentSession.create(store=JsonlSessionStore(tmp_path), session_id="sess_parser")
+    handler = MemoryCommandHandler(CurrentSessionState(session))
+
+    result = handler.handle("/remember promote the new onboarding flow")
+
+    assert result.output == "Saved to the daily log."
+    assert _split_promote_syntax("promote the new onboarding flow") == (
+        "promote the new onboarding flow",
+        None,
+    )
+    assert session.memory_store.load_index() == []
+
+
+def test_remember_parser_requires_topic_after_promote_flag(tmp_path: Path) -> None:
+    session = AgentSession.create(store=JsonlSessionStore(tmp_path), session_id="sess_parser_usage")
+    handler = MemoryCommandHandler(CurrentSessionState(session))
+
+    result = handler.handle("/remember pytest uses fixtures --promote")
+
+    assert result.output == "Usage: /remember <text> [--promote <topic>]"
+    assert not daily_log_path(session.memory_store.root).exists()
 
 
 def test_memory_tools_write_through_session_runtime(tmp_path: Path) -> None:

@@ -7,8 +7,12 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from firstcoder.app.commands import CommandResult
+from firstcoder.memory.durable import DURABLE_TOPIC_DEFAULTS
 from firstcoder.memory.prompt import MemoryProjector, load_memory_index_text
 from firstcoder.memory.runtime import MemoryRuntime
+
+_PROMOTABLE_TOPICS = frozenset(DURABLE_TOPIC_DEFAULTS)
+_INVALID_PROMOTE = ""
 
 
 class MemoryCommandSession(Protocol):
@@ -56,6 +60,8 @@ class MemoryCommandHandler:
 
     def _remember(self, raw: str) -> str:
         text, topic = _split_promote_syntax(raw)
+        if topic == _INVALID_PROMOTE:
+            return "Usage: /remember <text> [--promote <topic>]"
         if not text:
             return "Usage: /remember <text> [--promote <topic>]"
 
@@ -80,24 +86,29 @@ class MemoryCommandHandler:
 
 
 def _split_promote_syntax(raw: str) -> tuple[str, str | None]:
-    """解析两种显式提升写法，同时保留普通 note 的原始空格。
+    """解析显式提升写法，同时保留普通 note 的原始文本。
 
     支持 ``/remember text --promote topic`` 和 ``/remember --promote topic text``；
-    另支持 ``promote topic text`` 作为便于工具用户输入的别名。topic 最终仍由
-    DurableMemoryStore 校验，不能借命令解析绕过安全 slug 约束。
+    另支持已知 topic 的 ``promote topic text`` 兼容别名。别名必须命中 topic
+    白名单，避免普通句子 ``promote the ...`` 被误当成命令而丢失原文。
     """
 
     value = str(raw or "").strip()
     if not value:
         return "", None
 
-    prefix = re.match(r"^(?:promote|--promote)\s+([^\s]+)\s+(.+)$", value, re.IGNORECASE)
-    if prefix:
-        return prefix.group(2).strip(), prefix.group(1).strip()
+    prefix = re.match(r"^(promote|--promote)\s+([^\s]+)\s+(.+)$", value, re.IGNORECASE)
+    if prefix and (prefix.group(1).lower() == "--promote" or prefix.group(2) in _PROMOTABLE_TOPICS):
+        return prefix.group(3).strip(), prefix.group(2).strip()
+
+    if re.match(r"^--promote(?:\s|$)", value, re.IGNORECASE):
+        # 显式标记但缺少合法的 topic/text 时返回特殊空 topic；handler 会在
+        # 写入 daily log 前给出 usage，避免把用户笔误静默保存成普通 note。
+        return "", _INVALID_PROMOTE
 
     suffix = re.match(r"^(.+?)\s+--promote(?:\s+([^\s]+))?$", value, re.IGNORECASE)
     if suffix:
-        return suffix.group(1).strip(), (suffix.group(2) or "key-decisions").strip()
+        return suffix.group(1).strip(), (suffix.group(2) or _INVALID_PROMOTE).strip()
     return value, None
 
 

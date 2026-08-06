@@ -77,12 +77,13 @@ class MemoryRuntime:
         让上层知道这条输入不能被提升为可检索 durable note。
         """
 
-        original = self._bounded(self._normalize_text(text))
-        sanitized = self._bounded(self.security.redact_text(original))
+        original = self._normalize_text(text)
+        sanitized_full = self.security.redact_text(original)
+        sanitized = self._bounded(sanitized_full)
         if not sanitized:
             return MemoryWriteReceipt(ok=False, operation="daily_log", error="记忆内容不能为空")
 
-        redacted = sanitized != original
+        redacted = sanitized_full != original
         quarantined = redacted or not self.security.passes_quarantine(
             MemoryNote(topic="capture", text=original)
         )
@@ -127,14 +128,15 @@ class MemoryRuntime:
         """
 
         topic_text = str(topic or "").strip()
-        original = self._bounded(self._normalize_text(text))
-        sanitized = self._bounded(self.security.redact_text(original))
+        original = self._normalize_text(text)
+        sanitized_full = self.security.redact_text(original)
+        sanitized = self._bounded(sanitized_full)
         if not topic_text:
             return MemoryWriteReceipt(ok=False, operation="promote", error="记忆主题不能为空")
         if not sanitized:
             return MemoryWriteReceipt(ok=False, operation="promote", error="记忆内容不能为空")
 
-        redacted = sanitized != original
+        redacted = sanitized_full != original
         quarantined = redacted or not self.security.passes_quarantine(
             MemoryNote(topic=topic_text, text=original)
         )
