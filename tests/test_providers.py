@@ -812,6 +812,88 @@ def test_openai_compatible_provider_parses_streaming_usage() -> None:
     )
 
 
+class _FakeOpenAIStreamOptionsFallbackCompletions:
+    """第一次 create 拒绝 stream_options（参数错误），第二次成功。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def create(self, **params):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("BadRequest: unknown parameter 'stream_options'")
+        return iter(
+            [
+                _Object(model=params["model"], choices=[_Object(delta=_Object(content="hi"), finish_reason=None)]),
+                _Object(model=params["model"], choices=[_Object(delta={}, finish_reason="stop")]),
+            ]
+        )
+
+
+def test_openai_compatible_provider_falls_back_when_stream_options_rejected() -> None:
+    async def collect_events():
+        client = _FakeOpenAIStreamOptionsFallbackClient()
+        provider = OpenAICompatibleProvider(
+            name="test-openai",
+            model="test-model",
+            api_key="test-key",
+            client=client,
+        )
+        events = [event async for event in provider.astream(ChatRequest(messages=[ChatMessage(role="user", content="hi")]))]
+        return client, events
+
+    client, events = asyncio.run(collect_events())
+    assert client.completions.calls == 2  # 降级重试一次
+    assert any("streaming usage unavailable" in warning for warning in events[-1].diagnostics.warnings)
+    assert events[-1].response.content == "hi"
+
+
+class _FakeOpenAIStreamOptionsFallbackClient:
+    def __init__(self):
+        self.completions = _FakeOpenAIStreamOptionsFallbackCompletions()
+        self.chat = _Object(completions=self.completions)
+
+
+class _FakeOpenAIAuthFailStreamCompletions:
+    def __init__(self):
+        self.calls = 0
+
+    def create(self, **params):
+        self.calls += 1
+        raise RuntimeError("401 Unauthorized: invalid api key")
+
+
+def test_openai_compatible_provider_does_not_retry_on_unrelated_stream_error() -> None:
+    """认证/网络等错误不带 stream_options 关键词时直接抛出，不重复请求
+    （Codex P1 review fix 复验）。"""
+
+    async def collect_events():
+        client = _FakeOpenAIAuthFailStreamClient()
+        provider = OpenAICompatibleProvider(
+            name="test-openai",
+            model="test-model",
+            api_key="test-key",
+            client=client,
+        )
+        events = []
+        try:
+            async for event in provider.astream(ChatRequest(messages=[ChatMessage(role="user", content="hi")])):
+                events.append(event)
+        except ProviderError as exc:
+            return client, events, exc
+        return client, events, None
+
+    client, _events, exc = asyncio.run(collect_events())
+    assert client.completions.calls == 1  # 未重试
+    assert exc is not None
+
+
+class _FakeOpenAIAuthFailStreamClient:
+    def __init__(self):
+        self.completions = _FakeOpenAIAuthFailStreamCompletions()
+        self.chat = _Object(completions=self.completions)
+
+
 def test_openai_compatible_provider_parses_tool_calls():
     client = _FakeOpenAIClient()
     provider = OpenAICompatibleProvider(

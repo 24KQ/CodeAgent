@@ -35,6 +35,10 @@ class Redactor(Protocol):
     `memory.security.StaticSecurityPolicy` (Codex P1 review fix): `redact`
     handles plain text; `redact_artifact` recursively redacts any value,
     which is what `TraceWriter.emit` calls before persistence.
+
+    与 `memory.security.StaticSecurityPolicy` 的实际接口对齐：
+    `redact` 处理纯文本，`redact_artifact` 递归脱敏任意值
+    （`TraceWriter.emit` 持久化前调用）。
     """
 
     def redact(self, text: str) -> str: ...

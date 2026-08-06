@@ -54,12 +54,13 @@ class RunStore:
         if candidate.exists():
             # 已存在的目录必须是 store root 内的真实路径：resolve() 解析
             # symlink / junction 后做 containment 校验，防止 run 目录被
-            # 重定向到 root 之外。新建目录不检查（mkdir 不会跟随不存在的
-            # 链接；预置 symlink 的 TOCTOU 在 Windows 上需要特权，残留
-            # 风险在此处用注释记录）。
+            # 重定向到 root 之外。`resolved == root` 也拒绝——说明该目录是
+            # 指向 store root 本身的链接，写入会落进根目录（Codex P1 review
+            # fix 复验）。新建目录不检查（mkdir 不会跟随不存在的链接；预置
+            # symlink 的 TOCTOU 在 Windows 上需要特权，残留风险在此记录）。
             root = self.root.resolve()
             resolved = candidate.resolve()
-            if not (resolved == root or root in resolved.parents):
+            if root not in resolved.parents:
                 raise ValueError(f"run dir {value!r} resolves outside the store root")
         return candidate
 
@@ -90,6 +91,8 @@ class RunStore:
 
     def append_trace(self, task_state: object, event: dict) -> Path:
         path = self.trace_path(task_state)
+        if path.is_symlink():
+            raise ValueError(f"trace path {path} is a symlink; refusing to follow")
         path.parent.mkdir(parents=True, exist_ok=True)
         # trace 采用 jsonl 追加写入：agent 运行是流式事件序列，逐条落盘
         # 比最后一次性写整份 trace 更稳，也更适合调试。单 writer 不变量
@@ -106,10 +109,16 @@ class RunStore:
         return path
 
     def load_task_state(self, task_id: str) -> dict:
-        return json.loads(self.task_state_path(task_id).read_text(encoding="utf-8"))
+        path = self.task_state_path(task_id)
+        if path.is_symlink():
+            raise ValueError(f"task state path {path} is a symlink; refusing to follow")
+        return json.loads(path.read_text(encoding="utf-8"))
 
     def load_report(self, task_id: str) -> dict:
-        return json.loads(self.report_path(task_id).read_text(encoding="utf-8"))
+        path = self.report_path(task_id)
+        if path.is_symlink():
+            raise ValueError(f"report path {path} is a symlink; refusing to follow")
+        return json.loads(path.read_text(encoding="utf-8"))
 
     def _write_json_atomic(self, path: Path, payload: dict) -> None:
         # 原子写：先写临时文件，再 replace（P0 原语，memory/write.py）。

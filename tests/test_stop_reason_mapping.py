@@ -92,5 +92,18 @@ def test_failed_status_maps_finish_reason() -> None:
     assert map_turn_outcome(status="failed", finish_reason="cancelled") == STOP_REASON_CANCELLED
 
 
+def test_waiting_with_finish_reason_still_maps() -> None:
+    # finish_reason 映射优先于状态分支：waiting + error 也落到 model_error
+    # （Codex P1 review fix 复验）。
+    assert (
+        map_turn_outcome(status="waiting_for_user_input", finish_reason="error")
+        == STOP_REASON_MODEL_ERROR
+    )
+    assert (
+        map_turn_outcome(status="waiting_for_user_input", finish_reason="turn_timeout")
+        == STOP_REASON_TOOL_TIMEOUT
+    )
+
+
 def test_unknown_status_maps_to_empty() -> None:
     assert map_turn_outcome(status="weird") == ""

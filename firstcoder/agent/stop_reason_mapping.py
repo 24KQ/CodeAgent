@@ -81,13 +81,16 @@ def map_turn_outcome(
         return STOP_REASON_RESUME_LOAD_ERROR
     if error_type == "provider":
         return STOP_REASON_MODEL_ERROR
+    # finish_reason 映射优先于状态分支：任意状态（含 failed / waiting）下
+    # limit / timeout / interrupted / cancelled / error 都一致映射
+    # （Codex P1 review fix 复验）。
+    mapped = map_finish_reason(finish_reason)
+    if mapped:
+        return mapped
     if status == AgentTurnStatus.WAITING_FOR_USER_INPUT.value:
         if wait_kind == "permission_confirmation" and permission_denied:
             return STOP_REASON_APPROVAL_DENIED
         return ""
-    mapped = map_finish_reason(finish_reason)
-    if mapped:
-        return mapped
     if status == AgentTurnStatus.COMPLETED.value:
         return STOP_REASON_FINAL_ANSWER_RETURNED
     return ""

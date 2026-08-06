@@ -105,3 +105,29 @@ def test_run_dir_rejects_symlink_escape(tmp_path: Path) -> None:
         pytest.skip("symlink creation not permitted on this host")
     with pytest.raises(ValueError):
         store.run_dir("run_evil")
+
+
+def test_run_dir_rejects_symlink_to_store_root(tmp_path: Path) -> None:
+    """run 目录是指向 store root 本身的链接也必须拒绝（写入会落进根目录）。"""
+    store = RunStore(tmp_path / "runs")
+    link = tmp_path / "runs" / "run_root"
+    try:
+        link.symlink_to(tmp_path / "runs", target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation not permitted on this host")
+    with pytest.raises(ValueError):
+        store.run_dir("run_root")
+
+
+def test_append_trace_rejects_file_symlink(tmp_path: Path) -> None:
+    """trace 文件本身是 symlink 时拒绝跟随（Codex P1 review fix 复验）。"""
+    store = RunStore(tmp_path / "runs")
+    state = _state(tmp_path, run_id="run_link")
+    store.start_run(state)
+    target = tmp_path / "leaked.jsonl"
+    try:
+        store.trace_path("run_link").symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation not permitted on this host")
+    with pytest.raises(ValueError):
+        store.append_trace(state, {"event": "run_started"})

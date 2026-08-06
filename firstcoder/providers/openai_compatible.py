@@ -184,6 +184,13 @@ class OpenAICompatibleProvider(ChatProvider):
         except Exception as exc:
             if not params.get("stream_options"):
                 raise ProviderError(classify_provider_exception(exc), str(exc)) from exc
+            # 只对明确表示不识别 stream_options 的参数错误降级（错误消息含该
+            # 字段名）；认证/限流/网络等错误直接抛出，避免重复请求与重复计费
+            # （Codex P1 review fix 复验）。流迭代阶段才拒绝的端点不会触发
+            # 这里的降级——留待接线时评估。
+            lowered = str(exc).lower()
+            if "stream_options" not in lowered and "include_usage" not in lowered:
+                raise ProviderError(classify_provider_exception(exc), str(exc)) from exc
             params.pop("stream_options", None)
             diagnostics.warnings.append(
                 "provider rejected stream_options.include_usage; streaming usage unavailable"
