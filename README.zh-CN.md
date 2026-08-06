@@ -2,7 +2,7 @@
   <img src="assets/firstcoder-logo.png" alt="FirstCoder logo" width="156">
 </p>
 
-<h1 align="center">FocusCoder</h1>
+<h1 align="center">CodeAgent</h1>
 
 <p align="center">
   <strong>一个把 coding agent 内部机制摊开给你看的本地 Python 项目。</strong>

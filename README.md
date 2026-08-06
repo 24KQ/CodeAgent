@@ -2,7 +2,7 @@
   <img src="assets/firstcoder-logo.png" alt="FirstCoder logo" width="156">
 </p>
 
-<h1 align="center">FocusCoder</h1>
+<h1 align="center">CodeAgent</h1>
 
 <p align="center">
   <strong>A local Python coding agent built to make agent internals visible.</strong>
