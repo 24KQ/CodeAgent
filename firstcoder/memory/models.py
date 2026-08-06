@@ -23,9 +23,14 @@ RejectReason = Literal[
 
 @dataclass(frozen=True)
 class MemoryEvidence:
-    """Provenance of a durable memory note (fusion M6)."""
+    """Provenance of a durable memory note (fusion M6).
 
-    source_path: str
+    `source_path` is required in real use (the data plane always records
+    provenance); the empty default keeps the contract constructible for
+    tests and intermediate values.
+    """
+
+    source_path: str = ""
     session_id: str = ""
     anchor_hash: str = ""
     scope: str = "workspace"
@@ -43,11 +48,8 @@ class MemoryNote:
     evidence: MemoryEvidence = field(default_factory=MemoryEvidence)
     created_at: str = ""
 
-    def __post_init__(self) -> None:
-        if not self.note_id:
-            # note_id = sha256(topic+text)[:12] 的占位推导由数据面实现，
-            # 这里只保证契约字段存在。
-            object.__setattr__(self, "note_id", "")
+    # note_id = sha256(topic + text)[:12] 的推导由数据面实现（P2），
+    # 契约层只保证字段存在。
 
 
 @dataclass(frozen=True)
