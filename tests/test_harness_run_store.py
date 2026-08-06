@@ -119,6 +119,20 @@ def test_run_dir_rejects_symlink_to_store_root(tmp_path: Path) -> None:
         store.run_dir("run_root")
 
 
+def test_run_dir_rejects_symlink_aliasing_another_run(tmp_path: Path) -> None:
+    """run 目录 symlink 指向 store 内另一个 run：不出 root 但破坏 run 隔离，
+    同样必须拒绝（Codex P1 review fix 复验）。"""
+    store = RunStore(tmp_path / "runs")
+    store.start_run(_state(tmp_path, run_id="run_a"))
+    link = tmp_path / "runs" / "run_b"
+    try:
+        link.symlink_to(tmp_path / "runs" / "run_a", target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation not permitted on this host")
+    with pytest.raises(ValueError):
+        store.run_dir("run_b")
+
+
 def test_append_trace_rejects_file_symlink(tmp_path: Path) -> None:
     """trace 文件本身是 symlink 时拒绝跟随（Codex P1 review fix 复验）。"""
     store = RunStore(tmp_path / "runs")

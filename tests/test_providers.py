@@ -813,7 +813,13 @@ def test_openai_compatible_provider_parses_streaming_usage() -> None:
 
 
 class _FakeOpenAIStreamOptionsFallbackCompletions:
-    """第一次 create 拒绝 stream_options（参数错误），第二次成功。"""
+    """模拟不识别 stream_options 的兼容端点。
+
+    第一次 create 抛参数错误（错误消息含 stream_options 关键词），
+    第二次调用（降级重试，已移除 stream_options）成功返回正常 chunk
+    流。用于验证：只有消息含 stream_options / include_usage 的错误
+    才触发降级，且降级后不再携带该参数。
+    """
 
     def __init__(self):
         self.calls = 0
@@ -855,6 +861,12 @@ class _FakeOpenAIStreamOptionsFallbackClient:
 
 
 class _FakeOpenAIAuthFailStreamCompletions:
+    """模拟认证失败端点：错误消息不含 stream_options 关键词。
+
+    用于验证：非参数类错误（认证/限流/网络）必须直接抛出、不做降级
+    重试，避免重复请求与重复计费。
+    """
+
     def __init__(self):
         self.calls = 0
 

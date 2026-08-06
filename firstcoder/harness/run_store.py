@@ -14,7 +14,9 @@ directory paths inside the store root.
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import re
 from pathlib import Path
 
@@ -51,13 +53,13 @@ class RunStore:
     def run_dir(self, run_id: object) -> Path:
         value = self._check_run_id(run_id)
         candidate = self.root / value
+        if candidate.is_symlink():
+            # is_symlink()（lexists 语义）能抓住断裂链接——exists() 对断裂
+            # symlink 返回 False。run 目录不允许是任何形式的链接：既防逃逸
+            # 出 store root，也防指向 store 内其他 run 的别名破坏 run 隔离
+            # （Codex P1 review fix 复验）。
+            raise ValueError(f"run dir {value!r} must not be a symlink")
         if candidate.exists():
-            # 已存在的目录必须是 store root 内的真实路径：resolve() 解析
-            # symlink / junction 后做 containment 校验，防止 run 目录被
-            # 重定向到 root 之外。`resolved == root` 也拒绝——说明该目录是
-            # 指向 store root 本身的链接，写入会落进根目录（Codex P1 review
-            # fix 复验）。新建目录不检查（mkdir 不会跟随不存在的链接；预置
-            # symlink 的 TOCTOU 在 Windows 上需要特权，残留风险在此记录）。
             root = self.root.resolve()
             resolved = candidate.resolve()
             if root not in resolved.parents:
@@ -91,13 +93,13 @@ class RunStore:
 
     def append_trace(self, task_state: object, event: dict) -> Path:
         path = self.trace_path(task_state)
-        if path.is_symlink():
-            raise ValueError(f"trace path {path} is a symlink; refusing to follow")
         path.parent.mkdir(parents=True, exist_ok=True)
         # trace 采用 jsonl 追加写入：agent 运行是流式事件序列，逐条落盘
         # 比最后一次性写整份 trace 更稳，也更适合调试。单 writer 不变量
-        # 保证追加不需要跨进程锁。
-        with path.open("a", encoding="utf-8") as handle:
+        # 保证追加不需要跨进程锁。O_CREAT：首次写入时文件尚不存在
+        # （Codex P1 review fix 复验：_open_no_follow 不再吞掉创建）。
+        fd = self._open_no_follow(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, sort_keys=True, ensure_ascii=True))
             handle.write("\n")
         return path
@@ -109,16 +111,32 @@ class RunStore:
         return path
 
     def load_task_state(self, task_id: str) -> dict:
-        path = self.task_state_path(task_id)
-        if path.is_symlink():
-            raise ValueError(f"task state path {path} is a symlink; refusing to follow")
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(self._read_no_follow(self.task_state_path(task_id)))
 
     def load_report(self, task_id: str) -> dict:
-        path = self.report_path(task_id)
+        return json.loads(self._read_no_follow(self.report_path(task_id)))
+
+    @staticmethod
+    def _open_no_follow(path: Path, flags: int) -> int:
+        """is_symlink 前置检查 + POSIX O_NOFOLLOW 双保险（Codex P1 review fix）。
+
+        Windows 无 O_NOFOLLOW flag：前置检查与 open 之间仍存在理论 TOCTOU
+        窗口（需攻击者并发替换文件），记录为残留风险。
+        """
         if path.is_symlink():
-            raise ValueError(f"report path {path} is a symlink; refusing to follow")
-        return json.loads(path.read_text(encoding="utf-8"))
+            raise ValueError(f"{path} is a symlink; refusing to follow")
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        try:
+            return os.open(path, flags | no_follow)
+        except OSError as exc:
+            if no_follow and exc.errno == errno.ELOOP:
+                raise ValueError(f"{path} is a symlink; refusing to follow") from exc
+            raise
+
+    def _read_no_follow(self, path: Path) -> str:
+        fd = self._open_no_follow(path, os.O_RDONLY)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            return handle.read()
 
     def _write_json_atomic(self, path: Path, payload: dict) -> None:
         # 原子写：先写临时文件，再 replace（P0 原语，memory/write.py）。
