@@ -1,20 +1,27 @@
 """Daily log primitives (fusion P2, M1).
 
 Ported from pico `features/memory.py:78-110` with the M1 write-upgrade:
-the append is now a locked read-modify-write through
-`firstcoder.memory.write.locked_append_line` (Codex TOCTOU finding), so
-concurrent processes cannot lose or interleave entries.
+the append is now a locked read-modify-write through a shared `.daily.lock`
+(Codex TOCTOU finding), so concurrent processes cannot lose or interleave
+entries. The optional `source` evidence is written to a per-day sidecar
+(`<date>.evidence.jsonl`) under the same lock — the Store's
+`append_daily_log` delegates here, so both APIs serialize on one lock
+(Codex P2 review #3: previously two different locks could interleave).
 
 声明边界：本模块只管 daily log 的目录/路径/追加，不做任何内容判定；
-secrets 判定与 quarantine 在 security.py，evidence 侧车在 durable.py。
+secrets 判定与 quarantine 在 security.py，evidence 侧车行由
+`source` 参数原样记录（不校验）。
 """
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from pathlib import Path
 
-from firstcoder.memory.write import atomic_write_text, locked_append_line
+from firstcoder.memory.models import MemoryEvidence
+from firstcoder.memory.paths import ensure_no_link_or_junction
+from firstcoder.memory.write import atomic_write_bytes, atomic_write_text, cross_process_lock
 
 ENTRYPOINT_NAME = "MEMORY.md"
 
@@ -23,6 +30,11 @@ _EMPTY_INDEX = (
     "_Empty. `/remember` writes a daily log entry; `/dream` consolidates "
     "logs into topic files and adds entries here._\n"
 )
+
+
+def daily_lock_path(memory_dir: str | Path) -> Path:
+    """daily log 的唯一互斥锁：日志行与 evidence 侧车共用（见模块 docstring）。"""
+    return Path(memory_dir) / ".daily.lock"
 
 
 def ensure_memory_dir(memory_dir: str | Path) -> Path:
@@ -50,12 +62,35 @@ def append_to_daily_log(
     memory_dir: str | Path,
     entry: str,
     today: date | None = None,
+    *,
+    source: MemoryEvidence | None = None,
 ) -> Path | None:
-    """追加一条带时间戳的日志行（加锁读改写，防并发丢失）；空 entry 返回 None。"""
+    """追加一条带时间戳的日志行；`source` 给定时在同一把 `.daily.lock` 内
+    追加当天 evidence 侧车行（原子读改写，行序与日志一致）。空 entry 返回 None。
+    """
     entry = str(entry).strip()
     if not entry:
         return None
+    memory_dir = Path(memory_dir)
+    ensure_no_link_or_junction(memory_dir)
     path = daily_log_path(memory_dir, today=today)
     timestamp = datetime.now().strftime("%H:%M")
-    locked_append_line(path, f"- [{timestamp}] {entry}")
+    evidence_path = path.with_name(path.stem + ".evidence.jsonl")
+    with cross_process_lock(daily_lock_path(memory_dir)):
+        existing_log = path.read_text(encoding="utf-8") if path.exists() else ""
+        atomic_write_bytes(path, (existing_log + f"- [{timestamp}] {entry}" + "\n").encode("utf-8"))
+        if source is not None:
+            row = {
+                "text": entry,
+                "session_id": source.session_id,
+                "source_path": source.source_path,
+                "evidence_anchor_hash": source.anchor_hash,
+                "scope": source.scope,
+                "at": datetime.now().astimezone().isoformat(),
+            }
+            existing_evidence = evidence_path.read_text(encoding="utf-8") if evidence_path.exists() else ""
+            atomic_write_bytes(
+                evidence_path,
+                (existing_evidence + json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"),
+            )
     return path

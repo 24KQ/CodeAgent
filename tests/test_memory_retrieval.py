@@ -175,7 +175,7 @@ def test_scope_fingerprint_isolation(tmp_path: Path) -> None:
     ws_b = tmp_path / "ws_b"
     ws_a.mkdir()
     ws_b.mkdir()
-    store = DurableMemoryStore(tmp_path / "memory", workspace_root=ws_a)
+    store = DurableMemoryStore(ws_a / ".firstcoder" / "memory", workspace_root=ws_a)
     store.promote([("key-decisions", "pytest is the runner")])
 
     # 同 workspace 命中
@@ -207,3 +207,49 @@ def test_score_monotone_with_ranking() -> None:
     assert scores == sorted(scores, reverse=True)
     assert scores[0] >= 1000
     assert scores[1] < 1000
+
+
+def test_score_keyword_cap_below_exact_tag() -> None:
+    """keyword 分量封顶：重叠 100+ 个词也压不过 exact tag（Codex P2 review #8）。"""
+    many_words = " ".join(f"w{i}" for i in range(120))
+    state = {
+        "episodic_notes": [
+            _state_note(many_words, note_index=0),
+            _state_note("关于 python 的一切", tags=["pytest"], note_index=1),
+        ]
+    }
+    result = _retriever(state).retrieve(MemoryQuery(text="pytest " + many_words))
+    scores = [s.score for s in result.selections]
+    # 两个候选都命中（词重叠），但 exact tag 必须排最前且分数封顶不越界
+    assert result.selected_notes[0].text == "关于 python 的一切"
+    assert scores[0] >= 1000  # exact tag
+    assert scores[1] < 1000  # 99 个词封顶：990 + 归一化分量
+
+def test_score_recency_monotonic_modern_timestamps() -> None:
+    """现代时间戳（epoch 秒 >1e9）之间 score 仍随 recency 单调（Codex P2 review #8）。"""
+    state = {
+        "episodic_notes": [
+            _state_note("old pytest note", created_at="2026-01-01T00:00:00+00:00", note_index=0),
+            _state_note("new pytest note", created_at="2026-08-01T00:00:00+00:00", note_index=1),
+        ]
+    }
+    result = _retriever(state).retrieve(MemoryQuery(text="pytest"))
+    scores = [s.score for s in result.selections]
+    assert scores[0] > scores[1]
+    assert result.selected_notes[0].text == "new pytest note"
+
+
+def test_selections_globally_ranked() -> None:
+    """selections 全局按 score 降序：高分 rejected（quarantine）排在低分 selected 前。"""
+    state = {
+        "episodic_notes": [
+            _state_note("quarantined pytest note", tags=["pytest"], status="quarantined", note_index=0),
+            _state_note("clean pytest note", note_index=1),
+        ]
+    }
+    result = _retriever(state).retrieve(MemoryQuery(text="pytest"))
+    assert [s.text for s in result.selected_notes] == ["clean pytest note"]
+    assert result.selections[0].note.text == "quarantined pytest note"  # 分数最高，排最前
+    assert result.selections[0].reject_reason == "quarantined"
+    scores = [s.score for s in result.selections]
+    assert scores == sorted(scores, reverse=True)

@@ -5,6 +5,15 @@ and transparent: exact tag hit *1000, keyword overlap *10, recency, then
 index order — no embeddings (M4). The durable store is injected rather
 than hardcoded to a pico path, and output follows the P0 `RetrievalResult`
 contract (selected/rejected with reject_reason + score).
+
+审计一致性（Codex P2 review #6/#8）：score 是与排序 tuple 键严格同向的
+审计值——exact tag 恒高于 keyword 重叠（keyword 分量封顶），recency /
+note_index 分量归一化后不跨界、保持单调；`selections` 全局按 score 降序，
+高分 rejected（如 quarantine）排在低分 selected 之前，与排序序一致。
+
+快照读（Codex P2 review #5）：durable 数据经 `store.snapshot()` 单锁
+读入，一次查询不会看到不同代次的数据；episodic_notes 来自内存 state，
+无锁问题。
 """
 
 from __future__ import annotations
@@ -21,7 +30,7 @@ from firstcoder.memory.models import (
     RetrievalResult,
     RetrievalSelection,
 )
-from firstcoder.memory.provenance import apply_evidence_staleness, workspace_fingerprint
+from firstcoder.memory.provenance import workspace_fingerprint
 
 
 def _tokenize(text: str) -> set[str]:
@@ -106,6 +115,10 @@ class MemoryRetriever:
     `state` is the working-memory dict (M2); when present, its
     `episodic_notes` are folded into the candidate set like pico's
     state-based retrieval.
+
+    用法：可只传 `state`（episodic 检索），也可传 `store`（durable 检索）；
+    `workspace_root` 用于 fingerprint scope 比较与 evidence staleness
+    判定（与 `promote` 写 scope 时的 workspace 一致）。
     """
 
     def __init__(
@@ -122,9 +135,10 @@ class MemoryRetriever:
         for note in self.state.get("episodic_notes", []):
             yield dict(note)
         if self.store is not None:
-            for topic in self.store.load_index():
-                for note in self.store.load_topic_notes(topic["topic"]):
-                    yield apply_evidence_staleness(dict(note), self.workspace_root)
+            # 单一快照（Codex P2 review #5）：单锁内读完 index + 全部 topic，
+            # 避免一次查询跨锁读到不同代次的数据。
+            for note in self.store.snapshot(self.workspace_root):
+                yield note
 
     def _ranked(self, query: str) -> list[tuple[tuple[int, int, float, int], float, dict]]:
         query_tokens = _tokenize(query)
@@ -139,13 +153,16 @@ class MemoryRetriever:
             recency = _parse_timestamp(note.get("created_at"))
             note_index = int(note.get("note_index", 0))
             # 排序以 tuple 键 (exact_tag, keyword_overlap, recency, note_index)
-            # 为准；score 是与排序方向一致的启发式审计值（Codex P2 review #8）：
-            # recency 归一化到 <10，避免 epoch 秒数（~1.7e9）盖过 keyword 权重，
-            # 让审计里"分数更高"始终对应"排序更靠前"。
+            # 为准；score 是与排序键严格同向的审计值（Codex P2 review #8）：
+            # - keyword 分量封顶 99 个（990 < exact 1000），重叠再多也压不过
+            #   exact tag——与排序的 exact 绝对置前一致；
+            # - recency 用 1e12 归一化（epoch 秒 ~1.78e9 → ~0.0018），永不封顶，
+            #   现代时间戳之间也能拉开差异；
+            # - note_index 分量 1e9 归一化（笔记数远小于 1e9），保持单调。
             score = (
                 exact_tag_match * 1000
-                + keyword_overlap * 10
-                + min(recency / 1_000_000_000, 0.999)
+                + min(keyword_overlap, 99) * 10
+                + min(recency / 1_000_000_000_000, 0.999)
                 + min(note_index / 1_000_000_000, 0.001)
             )
             ranked.append(((exact_tag_match, keyword_overlap, recency, note_index), score, note))
@@ -180,8 +197,11 @@ class MemoryRetriever:
                         score=score,
                     )
                 )
+        # 审计 trail 全局按 score 降序（Codex P2 review #8）：高分 rejected
+        # （quarantine/stale 等）排在低分 selected 之前，与排序序一致。
+        selections = sorted(selected + rejected, key=lambda s: s.score, reverse=True)
         return RetrievalResult(
             query=query,
-            selections=selected + rejected,
+            selections=selections,
             query_hash=_query_hash(query.text),
         )

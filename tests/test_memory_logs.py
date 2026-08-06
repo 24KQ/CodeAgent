@@ -61,3 +61,30 @@ def test_append_to_daily_log_strips_whitespace(tmp_path: Path) -> None:
     assert path is not None
     assert "note text" in path.read_text(encoding="utf-8")
     assert "note text  " not in path.read_text(encoding="utf-8")
+
+
+def test_append_to_daily_log_with_source_writes_sidecar(tmp_path: Path) -> None:
+    """source 给定时在同一把 .daily.lock 内追加 evidence 侧车行（Codex P2 review #4）。"""
+    import json
+
+    from firstcoder.memory.models import MemoryEvidence
+
+    today = date(2026, 8, 6)
+    source = MemoryEvidence(source_path="src/a.py", session_id="s1", anchor_hash="h1", scope="workspace")
+    path = append_to_daily_log(tmp_path / "memory", "remember: use pytest", today=today, source=source)
+    assert path is not None
+
+    evidence_path = path.with_name(path.stem + ".evidence.jsonl")
+    rows = [json.loads(line) for line in evidence_path.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["text"] == "remember: use pytest"
+    assert rows[0]["session_id"] == "s1"
+    assert rows[0]["evidence_anchor_hash"] == "h1"
+    assert rows[0]["scope"] == "workspace"
+
+
+def test_append_to_daily_log_without_source_no_sidecar(tmp_path: Path) -> None:
+    today = date(2026, 8, 6)
+    path = append_to_daily_log(tmp_path / "memory", "plain entry", today=today)
+    assert path is not None
+    assert not path.with_name(path.stem + ".evidence.jsonl").exists()

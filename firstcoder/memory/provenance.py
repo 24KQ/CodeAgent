@@ -83,7 +83,7 @@ def workspace_fingerprint(workspace_root: str | Path) -> str:
     return fingerprint
 
 
-def _source_path_for_evidence(workspace_root: str | Path | None, source_path: str | None) -> Path | None:
+def source_path_for_evidence(workspace_root: str | Path | None, source_path: str | None) -> Path | None:
     """evidence source_path 落盘的是 workspace 相对路径，取哈希时还原为绝对路径。"""
     if not source_path:
         return None
@@ -108,7 +108,7 @@ def apply_evidence_staleness(
     source_path = evidence.get("source_path")
     if not stored_hash or not source_path:
         return note
-    current_hash = compute_anchor_hash(_source_path_for_evidence(workspace_root, source_path))
+    current_hash = compute_anchor_hash(source_path_for_evidence(workspace_root, source_path))
     if current_hash and current_hash != stored_hash:
         note = dict(note)
         note["stale_evidence"] = True

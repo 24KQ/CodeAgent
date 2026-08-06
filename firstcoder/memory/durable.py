@@ -24,9 +24,15 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Iterator
 
-from firstcoder.memory.logs import ENTRYPOINT_NAME, ensure_memory_dir
+from firstcoder.memory.logs import ENTRYPOINT_NAME, append_to_daily_log, daily_lock_path, ensure_memory_dir
 from firstcoder.memory.models import MemoryEvidence, MemoryNote
-from firstcoder.memory.provenance import workspace_fingerprint
+from firstcoder.memory.paths import ensure_no_link_or_junction, validate_memory_root
+from firstcoder.memory.provenance import (
+    apply_evidence_staleness,
+    compute_anchor_hash,
+    source_path_for_evidence,
+    workspace_fingerprint,
+)
 from firstcoder.memory.security import should_quarantine
 from firstcoder.memory.write import atomic_write_bytes, cross_process_lock
 
@@ -68,6 +74,15 @@ def note_id_for(topic_slug: str, note_text: str) -> str:
     return hashlib.sha256(f"{topic_slug}\n{note_text}".encode("utf-8")).hexdigest()[:12]
 
 
+def _fold_note_text(note_text: object) -> str:
+    """多行 note 折叠为单行：topic 文件的 `- ` 行格式不允许内嵌换行。
+
+    折叠必须在 note_id 计算前统一执行——promote 与 upsert 共用
+    （Codex P2 review #3：原实现两处不一致导致 upsert 的 evidence 丢失）。
+    """
+    return " ".join(str(note_text or "").split()).strip()
+
+
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat()
 
@@ -91,18 +106,26 @@ def _tokenize(text: str) -> set[str]:
 
 class DurableMemoryStore:
     def __init__(self, root: str | Path, workspace_root: str | Path | None = None) -> None:
-        self.root = Path(root)
-        self.workspace_root = str(workspace_root) if workspace_root is not None else None
+        if workspace_root is not None:
+            # P1（Codex P2 review #1）：root 必须在 workspace 内，越界立即拒绝——
+            # 否则 memory 写入可被导向任意目录。
+            self.root = validate_memory_root(Path(root), workspace_root)
+            self.workspace_root = str(workspace_root)
+        else:
+            self.root = Path(root)
+            self.workspace_root = None
         self.index_path = self.root / ENTRYPOINT_NAME
         self.topics_dir = self.root / "topics"
         self.lock_path = self.root / ".store.lock"
 
     @staticmethod
     def _check_topic_slug(topic: object) -> str:
-        """topic slug 必须是安全目录名（Codex P2 review #1，P1 项）。
+        """topic slug 规范化 + 校验（Codex P2 review #1，P1 项）。
 
-        拒绝空值、路径分隔符、点、空格、Windows 保留名——topic 会拼进
-        `topics/<topic>.md` 路径，不校验就是目录逃逸口。
+        契约：strip 首尾空白后必须是安全目录名（`[A-Za-z0-9_-]+`）且不是
+        Windows 保留名——topic 会拼进 `topics/<topic>.md` 路径，不校验就
+        是目录逃逸口。首尾空白属于规范化（返回 strip 后的值），内容里的
+        空格/分隔符/点则是拒绝。
         """
         value = str(topic or "").strip()
         if not _TOPIC_SLUG_PATTERN.fullmatch(value):
@@ -119,8 +142,13 @@ class DurableMemoryStore:
 
         锁不可重入（portalocker LOCK_EX）：事务内一律使用 *_unlocked
         内部变体读，公共读取 API 各自持锁调用这些变体。
+
+        写前守卫：root/topics/logs 目录若被预置为 symlink/junction，原子
+        写会被导向 workspace 外（Codex P2 review #1，P1 项）——拒绝写入。
         """
         ensure_memory_dir(self.root)
+        ensure_no_link_or_junction(self.root / "topics")
+        ensure_no_link_or_junction(self.root / "logs")
         with cross_process_lock(self.lock_path):
             yield
 
@@ -257,6 +285,15 @@ class DurableMemoryStore:
         default_evidence = self._default_note_metadata(topic, note_text, topic_path=topic_path)["evidence"]
         evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else {}
         default_evidence.update(evidence)
+        # 证据锚点默认生成（pico memory.py:853-857，Codex P2 review #8）：
+        # source_path 存在且 anchor 缺失时按当前文件内容自动计算——内容在
+        # 捕获后变更会立即表现为 stale_evidence。
+        if not default_evidence.get("evidence_anchor_hash") and default_evidence.get("source_path"):
+            anchor = compute_anchor_hash(
+                source_path_for_evidence(self.workspace_root, default_evidence.get("source_path"))
+            )
+            if anchor:
+                default_evidence["evidence_anchor_hash"] = anchor
         row["evidence"] = default_evidence
         row.setdefault("scope", self._scope())
         return row
@@ -335,12 +372,15 @@ class DurableMemoryStore:
 
         一致性模型（M3 版本号/CAS 升级，Codex P2 review #1）：
         - 整个提升在同一把 store 锁（`_transaction`）内完成，读写互斥；
-        - 写顺序 metadata → topic → index，index 最后发布为提交点：读者
-          持锁要么看到旧 index（新 topic 未注册，等价旧版本），要么看到
-          含新 topic 的完整新 index；
+        - 对每个 topic：topic 文件先落盘、metadata 后落盘（`_write_topic`
+          内部顺序），两者之间的崩溃窗口由持锁读取的惰性 metadata 回填
+          自愈——读取永远能得到与 topic 文件一致的新 metadata；
+        - index 最后发布为全局提交点：读者持锁要么看到旧 index（新 topic
+          未注册，等价旧版本），要么看到含新 topic 的完整新 index；
         - index 带递增版本号（`- version: N`），供外部检测代次；
-        - 崩溃（进程被杀）可能留下已写但未注册的 topic/version，不会产生
-          撕裂可见性，未注册写入在下次写时被覆盖。
+        - 崩溃（进程被杀）可能留下已写但未注册的 topic/metadata，不会
+          产生撕裂可见性；index 未推进时，下一次 promote（含重复 note）
+          会把 index 补发到最新版本（自愈）。
         """
         if not promotions:
             return [], []
@@ -354,8 +394,9 @@ class DurableMemoryStore:
             superseded = []
             for topic, note_text in promotions:
                 topic = self._check_topic_slug(topic)
-                # 多行 note 会破坏 topic 文件的 "- " 行格式：折叠为单行。
-                note_text = " ".join(str(note_text or "").split()).strip()
+                # 多行 note 折叠为单行：note_id 必须基于折叠后的文本
+                # （与 `_apply_note_metadata` 共用同一 helper，见该函数）。
+                note_text = _fold_note_text(note_text)
                 if not note_text:
                     continue
                 meta = DURABLE_TOPIC_DEFAULTS[topic]
@@ -437,41 +478,18 @@ class DurableMemoryStore:
         `load_daily_log_evidence` 取回 session/source/anchor，填进 durable
         metadata 的 evidence。
 
-        日志行与侧车行在同一把 `.daily.lock` 锁内读改写，保证并发进程的
-        行序一致（Codex P2 review #4）；进程崩溃可能留下"日志已写、侧车
-        未写"的窗口（调用方会收到异常），但不会有并发撕裂。
+        委托 logs.append_to_daily_log：日志行与侧车行在同一把 `.daily.lock`
+        内读改写（Codex P2 review #4：与 logs 层 API 共用同一把锁，两种
+        入口混用时行序一致）；进程崩溃可能留下"日志已写、侧车未写"的窗口
+        （调用方会收到异常），但不会有并发撕裂。
         """
-        from firstcoder.memory.logs import daily_log_path
-
-        entry = str(text).strip()
-        if not entry:
-            return None
-        path = daily_log_path(self.root, today=None)
-        timestamp = datetime.now().strftime("%H:%M")
-        evidence_path = path.with_name(path.stem + ".evidence.jsonl")
-        with cross_process_lock(self.root / ".daily.lock"):
-            existing_log = path.read_text(encoding="utf-8") if path.exists() else ""
-            atomic_write_bytes(path, (existing_log + f"- [{timestamp}] {entry}" + "\n").encode("utf-8"))
-            if source is not None:
-                row = {
-                    "text": entry,
-                    "session_id": source.session_id,
-                    "source_path": source.source_path,
-                    "evidence_anchor_hash": source.anchor_hash,
-                    "scope": source.scope,
-                    "at": now_iso(),
-                }
-                existing_evidence = evidence_path.read_text(encoding="utf-8") if evidence_path.exists() else ""
-                atomic_write_bytes(
-                    evidence_path,
-                    (existing_evidence + json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"),
-                )
-        return path
+        return append_to_daily_log(self.root, text, source=source)
 
     def load_daily_log_evidence(self, today: "date | None" = None) -> list[dict]:
         """读取当天 evidence 侧车（P3 /remember 的证据来源）。
 
-        返回侧车行列表；无侧车文件返回空列表。
+        返回侧车行列表；无侧车文件返回空列表。持 `.daily.lock` 读取，
+        与写入互斥（Codex P2 review #4）。
         """
         from firstcoder.memory.logs import daily_log_path
 
@@ -480,13 +498,14 @@ class DurableMemoryStore:
         if not evidence_path.exists():
             return []
         rows = []
-        for line in evidence_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+        with cross_process_lock(daily_lock_path(self.root)):
+            for line in evidence_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
         return rows
 
     def upsert_topic(self, note: MemoryNote) -> None:
@@ -499,13 +518,18 @@ class DurableMemoryStore:
         self._apply_note_metadata(note)
 
     def _apply_note_metadata(self, note: MemoryNote) -> None:
-        """把契约笔记里的 evidence/supersedes 覆盖到 metadata 行。"""
+        """把契约笔记里的 evidence/supersedes/scope 覆盖到 metadata 行。
+
+        note_id 基于折叠后的文本查找（与 `promote` 的落盘文本一致，
+        Codex P2 review #3：原实现用原始文本找行，多行 note 的 evidence
+        静默丢失）。
+        """
         with self._transaction():
             metadata = self._load_topic_metadata(note.topic)
-            row = metadata.get(note_id_for(note.topic, note.text))
+            row = metadata.get(note_id_for(note.topic, _fold_note_text(note.text)))
             if row is None:
                 return
-            if note.evidence.session_id or note.evidence.source_path:
+            if note.evidence.session_id or note.evidence.source_path or note.evidence.scope:
                 evidence = dict(row.get("evidence") or {})
                 if note.evidence.session_id:
                     evidence["session_id"] = note.evidence.session_id
@@ -513,7 +537,19 @@ class DurableMemoryStore:
                     evidence["source_path"] = note.evidence.source_path
                 if note.evidence.anchor_hash:
                     evidence["evidence_anchor_hash"] = note.evidence.anchor_hash
+                # 锚点缺失时按 source 文件当前内容自动生成（同
+                # `_metadata_for_note`，Codex P2 review #8）。
+                if not evidence.get("evidence_anchor_hash") and evidence.get("source_path"):
+                    anchor = compute_anchor_hash(
+                        source_path_for_evidence(self.workspace_root, evidence.get("source_path"))
+                    )
+                    if anchor:
+                        evidence["evidence_anchor_hash"] = anchor
                 row["evidence"] = evidence
+            # scope 落在 row 顶层（`_default_note_metadata` 约定）；
+            # 契约里的 scope（如 "global"）必须持久化（Codex P2 review #3）。
+            if note.evidence.scope:
+                row["scope"] = note.evidence.scope
             if note.supersedes:
                 row["supersedes"] = note.supersedes
             self._write_topic_metadata(note.topic, metadata)
@@ -547,3 +583,18 @@ class DurableMemoryStore:
                         )
                     )
         return notes
+
+    def snapshot(self, workspace_root: str | Path | None = None) -> list[dict]:
+        """单一快照读：单锁内读 index + 全部 topic 笔记（含 metadata 回填）。
+
+        Codex P2 review #5：一次 retrieval 若分多次锁读（先 index 再逐
+        topic），锁间可插入一次 promote，导致同一查询看到不同代次的数据；
+        retrieval 应使用本方法代替逐锁读取。返回原始 dict 形状并应用
+        evidence staleness 判定。
+        """
+        with cross_process_lock(self.lock_path):
+            notes: list[dict] = []
+            for topic in self._load_index_unlocked():
+                for note in self._load_topic_notes_unlocked(topic["topic"]):
+                    notes.append(apply_evidence_staleness(dict(note), workspace_root))
+            return notes

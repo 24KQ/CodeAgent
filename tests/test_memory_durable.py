@@ -290,10 +290,134 @@ def test_promote_real_workspace_scope(tmp_path: Path) -> None:
     """提供 workspace_root 时 scope 写入真实 fingerprint（Codex P2 review #5）。"""
     from firstcoder.memory.provenance import workspace_fingerprint
 
-    store = DurableMemoryStore(tmp_path / "memory", workspace_root=tmp_path / "ws")
-    (tmp_path / "ws").mkdir(parents=True)
+    ws = tmp_path / "ws"
+    ws.mkdir(parents=True)
+    store = DurableMemoryStore(ws / ".firstcoder" / "memory", workspace_root=ws)
     store.promote([("key-decisions", "pytest is the runner")])
     rows = store._load_topic_metadata("key-decisions")
     note_id = note_id_for("key-decisions", "pytest is the runner")
-    assert rows[note_id]["scope"] == workspace_fingerprint(tmp_path / "ws")
+    assert rows[note_id]["scope"] == workspace_fingerprint(ws)
     assert rows[note_id]["scope"] != "workspace_fingerprint"
+
+
+def test_store_root_must_live_in_workspace(tmp_path: Path) -> None:
+    """root 在 workspace 之外必须在构造时拒绝（Codex P2 review #1，P1 项）。"""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with pytest.raises(ValueError):
+        DurableMemoryStore(tmp_path / "elsewhere", workspace_root=ws)
+    # workspace 内（含嵌套）合法
+    DurableMemoryStore(ws / ".firstcoder" / "memory", workspace_root=ws)
+    DurableMemoryStore(ws, workspace_root=ws)
+
+
+def test_promote_refuses_junction_topics_dir(tmp_path: Path) -> None:
+    """topics 目录被预置为 symlink/junction 时拒绝写入（Codex P2 review #1）。"""
+    store = _store(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    topics_dir = tmp_path / "memory" / "topics"
+    topics_dir.mkdir(parents=True)
+    topics_dir.rmdir()
+    try:
+        topics_dir.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation not permitted on this host")
+    with pytest.raises(ValueError):
+        store.promote([("key-decisions", "x")])
+
+
+def test_metadata_write_failure_self_heals_on_read(tmp_path: Path, monkeypatch) -> None:
+    """topic 写成功、metadata 写失败（崩溃窗口）→ 提交点（index 版本）不
+    推进，持锁读取触发惰性回填自愈（Codex P2 review #1）。"""
+    store = _store(tmp_path)
+    store.promote([("key-decisions", "First note")])
+    old_version = store.index_version()
+
+    real_write_metadata = DurableMemoryStore._write_topic_metadata
+
+    def failing_write_metadata(self, topic, rows):
+        raise OSError("simulated metadata write failure")
+
+    monkeypatch.setattr(DurableMemoryStore, "_write_topic_metadata", failing_write_metadata)
+    with pytest.raises(OSError):
+        store.promote([("key-decisions", "Second note")])
+    monkeypatch.setattr(DurableMemoryStore, "_write_topic_metadata", real_write_metadata)
+
+    # 提交点未推进：新 topic 内容不可见（index 仍是旧版本）
+    assert store.index_version() == old_version
+    # 读取自愈：topic 文件里的新 note 得到完整 metadata 行
+    notes = store.load_topic_notes("key-decisions")
+    assert [n["text"] for n in notes] == ["First note", "Second note"]
+    rows = store._load_topic_metadata("key-decisions")
+    assert rows[note_id_for("key-decisions", "Second note")]["status"] == "active"
+    assert rows[note_id_for("key-decisions", "Second note")]["scope"] == "workspace_fingerprint"
+
+
+def test_upsert_multiline_note_keeps_evidence(tmp_path: Path) -> None:
+    """多行 note 的 evidence 在 upsert 后不丢失（Codex P2 review #3）：
+    promote 落盘的是折叠文本，metadata 查找必须基于同一折叠结果。"""
+    store = _store(tmp_path)
+    note = MemoryNote(
+        topic="key-decisions",
+        text="line one\nline two",
+        evidence=MemoryEvidence(source_path="src/a.py", session_id="s1", anchor_hash="h1"),
+    )
+    store.upsert_topic(note)
+    rows = store._load_topic_metadata("key-decisions")
+    folded_id = note_id_for("key-decisions", "line one line two")
+    assert rows[folded_id]["evidence"]["source_path"] == "src/a.py"
+    assert rows[folded_id]["evidence"]["session_id"] == "s1"
+    assert rows[folded_id]["evidence"]["evidence_anchor_hash"] == "h1"
+
+
+def test_upsert_persists_scope(tmp_path: Path) -> None:
+    """契约 scope（如 global）必须持久化到 metadata row 顶层（Codex P2 review #3）。"""
+    store = _store(tmp_path)
+    note = MemoryNote(
+        topic="key-decisions",
+        text="pytest note",
+        evidence=MemoryEvidence(scope="global"),
+    )
+    store.upsert_topic(note)
+    rows = store._load_topic_metadata("key-decisions")
+    assert rows[note_id_for("key-decisions", "pytest note")]["scope"] == "global"
+
+
+def test_anchor_hash_auto_computed_from_source(tmp_path: Path) -> None:
+    """source_path 存在且 anchor 缺失时按文件内容自动计算（Codex P2 review #8）。"""
+    import hashlib
+
+    ws = tmp_path / "ws"
+    (ws / "src").mkdir(parents=True)
+    target = ws / "src" / "a.py"
+    target.write_text("def f(): return 1", encoding="utf-8")
+    store = DurableMemoryStore(ws / ".firstcoder" / "memory", workspace_root=ws)
+    note = MemoryNote(
+        topic="key-decisions",
+        text="pytest note",
+        evidence=MemoryEvidence(source_path="src/a.py", session_id="s1"),
+    )
+    store.upsert_topic(note)
+    rows = store._load_topic_metadata("key-decisions")
+    assert rows[note_id_for("key-decisions", "pytest note")]["evidence"]["evidence_anchor_hash"] == (
+        hashlib.sha256(b"def f(): return 1").hexdigest()
+    )
+
+
+def test_topic_slug_normalizes_outer_whitespace(tmp_path: Path) -> None:
+    """首尾空白是规范化而非拒绝：strip 后落成安全 slug（Codex P2 review #7）。"""
+    store = _store(tmp_path)
+    store.promote([(" key-decisions ", "x")])
+    assert [topic["topic"] for topic in store.load_index()] == ["key-decisions"]
+
+
+def test_snapshot_single_locked_read(tmp_path: Path) -> None:
+    """snapshot() 单锁返回全部 topic 笔记（含回填与 staleness），形状同 load。"""
+    store = _store(tmp_path)
+    store.promote([("key-decisions", "First note")])
+    store.promote([("user-preferences", "dark mode")])
+    notes = store.snapshot()
+    assert [n["text"] for n in notes] == ["First note", "dark mode"]
+    assert all(n["status"] == "active" for n in notes)
+    assert all("note_id" in n for n in notes)

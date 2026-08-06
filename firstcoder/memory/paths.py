@@ -47,6 +47,30 @@ def resolve_memory_path(memory_root: Path, candidate: str | Path) -> Path:
     return resolved
 
 
+def _is_link_or_junction(path: Path) -> bool:
+    """路径是 symlink 或 Windows junction（目录重解析点）即为链接。
+
+    Python 3.12 起 `Path.is_symlink()` 与 `Path.is_junction()` 分离：
+    3.12 上 junction 对 `is_symlink()` 返回 False，必须显式检查
+    （与 harness/run_store.py 同一实现，Codex re-review #4 指出）。
+    """
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    return bool(is_junction and is_junction())
+
+
+def ensure_no_link_or_junction(path: Path) -> None:
+    """内存写入前守卫：path 或其一阶父目录是 symlink/junction 即拒绝。
+
+    守卫目录级链接（topics/logs 目录被预置为链接会把原子写导向 workspace
+    外）；文件级写入走 temp+rename，不跟随已存在文件本身的链接。
+    """
+    for candidate in (Path(path), Path(path).parent):
+        if _is_link_or_junction(candidate):
+            raise ValueError(f"memory write refused: {candidate} is a symlink/junction")
+
+
 class DefaultWorkspaceScope:
     """Concrete `WorkspaceScope`: memory root pinned under the workspace.
 
