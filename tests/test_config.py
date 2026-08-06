@@ -19,7 +19,7 @@ from firstcoder.providers.presets import PROVIDER_PRESETS
 def test_load_config_has_no_implicit_provider_without_catalog(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
 
-    config = load_config(env={})
+    config = load_config(project_root=tmp_path, env={})
 
     assert config.model_catalog().profiles == ()
 

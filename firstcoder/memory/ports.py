@@ -1,0 +1,60 @@
+"""Stable protocol ports for the memory domain (fusion P0).
+
+All ports are structural Protocols in the FirstCoder idiom
+(see firstcoder/agent/ports.py). P0 defines contracts only — no
+implementations. Existing behavior must remain unchanged until a
+port has a real implementation wired in (P2 memory data plane,
+P6 auto-dream).
+"""
+
+from __future__ import annotations
+
+from typing import Any, Protocol
+
+from firstcoder.memory.models import (
+    MemoryEvidence,
+    MemoryNote,
+    MemoryQuery,
+    PromotionCandidate,
+    RetrievalResult,
+)
+
+
+class MemoryStorePort(Protocol):
+    """Durable memory storage: daily logs, topic notes, metadata index."""
+
+    def append_daily_log(self, text: str, *, source: MemoryEvidence) -> None: ...
+    def upsert_topic(self, note: MemoryNote) -> None: ...
+    def read_index(self) -> list[MemoryNote]: ...
+
+
+class MemoryRetrievalPort(Protocol):
+    """Memory retrieval: query -> ranked notes with an audit trail."""
+
+    def retrieve(self, query: MemoryQuery) -> RetrievalResult: ...
+
+
+class MemoryPromotionPolicy(Protocol):
+    """Decides which working-memory entries become durable notes."""
+
+    def evaluate(self, entry: dict[str, Any]) -> PromotionCandidate | None: ...
+
+
+class MemorySecurityPolicy(Protocol):
+    """Static security rules: secret patterns, quarantine gate, redaction."""
+
+    def redact(self, text: str) -> str: ...
+    def passes_quarantine(self, note: MemoryNote) -> bool: ...
+
+
+class WorkspaceScope(Protocol):
+    """Path constraints: memory root location and workspace residency."""
+
+    def memory_root(self) -> str: ...
+    def is_within_workspace(self, path: str) -> bool: ...
+
+
+class BoundedDreamRunner(Protocol):
+    """Bounded LLM maintenance runner with a restricted write scope."""
+
+    def run_maintenance(self, *, write_scope: WorkspaceScope) -> None: ...
