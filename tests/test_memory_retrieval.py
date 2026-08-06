@@ -1,0 +1,151 @@
+"""P2 tests: memory retrieval with audit trail (retrieval.py, fusion M4)."""
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+from firstcoder.memory.durable import DurableMemoryStore, note_id_for
+from firstcoder.memory.models import MemoryEvidence, MemoryNote, MemoryQuery
+from firstcoder.memory.retrieval import MemoryRetriever
+
+
+def _state_note(text: str, **extra) -> dict:
+    note = {
+        "text": text,
+        "tags": [],
+        "source": "",
+        "created_at": "2026-08-06T00:00:00+00:00",
+        "note_index": 0,
+        "kind": "episodic",
+    }
+    note.update(extra)
+    return note
+
+
+def _retriever(state: dict | None = None, **kwargs) -> MemoryRetriever:
+    return MemoryRetriever(state=state or {}, **kwargs)
+
+
+def test_no_match_returns_empty() -> None:
+    result = _retriever({"episodic_notes": [_state_note("nothing in common")]}).retrieve(
+        MemoryQuery(text="pytest")
+    )
+    assert result.selections == []
+    assert result.selected_notes == []
+
+
+def test_exact_tag_beats_keyword_overlap() -> None:
+    state = {
+        "episodic_notes": [
+            _state_note("pytest is fast", note_index=0),
+            _state_note("关于 python 的一切", tags=["pytest"], note_index=1),
+        ]
+    }
+    result = _retriever(state).retrieve(MemoryQuery(text="pytest"))
+    notes = [selection.note.text for selection in result.selections]
+    assert notes[0] == "关于 python 的一切"  # exact tag 优先
+
+
+def test_recency_breaks_ties() -> None:
+    state = {
+        "episodic_notes": [
+            _state_note("old pytest note", created_at="2026-01-01T00:00:00+00:00", note_index=0),
+            _state_note("new pytest note", created_at="2026-08-01T00:00:00+00:00", note_index=1),
+        ]
+    }
+    result = _retriever(state).retrieve(MemoryQuery(text="pytest"))
+    assert result.selected_notes[0].text == "new pytest note"
+
+
+def test_query_hash_is_deterministic() -> None:
+    first = _retriever({}).retrieve(MemoryQuery(text="pytest"))
+    second = _retriever({}).retrieve(MemoryQuery(text="pytest"))
+    assert first.query_hash == second.query_hash
+    assert len(first.query_hash) == 12
+
+
+def test_quarantined_rejected_unless_requested() -> None:
+    state = {"episodic_notes": [_state_note("pytest note", status="quarantined")]}
+    default = _retriever(state).retrieve(MemoryQuery(text="pytest"))
+    assert default.selected_notes == []
+    assert default.selections[0].reject_reason == "quarantined"
+
+    included = _retriever(state).retrieve(MemoryQuery(text="pytest", include_quarantined=True))
+    assert [s.text for s in included.selected_notes] == ["pytest note"]
+
+
+def test_superseded_rejected() -> None:
+    state = {"episodic_notes": [_state_note("old pytest note", status="superseded")]}
+    result = _retriever(state).retrieve(MemoryQuery(text="pytest"))
+    assert result.selected_notes == []
+    assert result.selections[0].reject_reason == "superseded"
+
+
+def test_scope_mismatch_rejected() -> None:
+    state = {"episodic_notes": [_state_note("pytest note", scope="other-project")]}
+    result = _retriever(state).retrieve(MemoryQuery(text="pytest"))
+    assert result.selected_notes == []
+    assert result.selections[0].reject_reason == "scope_mismatch"
+
+
+def test_limit_caps_selected_and_rejects_rest() -> None:
+    state = {
+        "episodic_notes": [
+            _state_note(f"pytest note {i}", note_index=i) for i in range(3)
+        ]
+    }
+    result = _retriever(state).retrieve(MemoryQuery(text="pytest", limit=1))
+    assert len(result.selected_notes) == 1
+    reasons = [s.reject_reason for s in result.selections if not s.selected]
+    assert reasons == ["below_limit", "below_limit"]
+
+
+def test_stale_evidence_rejected(tmp_path: Path) -> None:
+    """anchor 与当前文件 hash 不一致 → stale_evidence 拒绝。"""
+    target = tmp_path / "src" / "a.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("v1", encoding="utf-8")
+
+    store = DurableMemoryStore(tmp_path / "memory")
+    store.promote([("key-decisions", "pytest is the runner")])
+    store.upsert_topic(
+        MemoryNote(
+            topic="key-decisions",
+            text="pytest is the runner",
+            evidence=MemoryEvidence(
+                source_path="src/a.py",
+                session_id="s1",
+                anchor_hash=hashlib.sha256(b"v1").hexdigest(),
+            ),
+        )
+    )
+    target.write_text("v2", encoding="utf-8")  # 文件已变
+
+    result = MemoryRetriever(store=store, workspace_root=str(tmp_path)).retrieve(
+        MemoryQuery(text="pytest")
+    )
+    assert result.selected_notes == []
+    assert result.selections[0].reject_reason == "stale_evidence"
+
+
+def test_retrieves_from_durable_store(tmp_path: Path) -> None:
+    store = DurableMemoryStore(tmp_path / "memory")
+    store.promote([("key-decisions", "pytest is the test runner")])
+    store.promote([("user-preferences", "dark mode preferred")])
+
+    result = MemoryRetriever(store=store).retrieve(MemoryQuery(text="pytest"))
+    assert [s.text for s in result.selected_notes] == ["pytest is the test runner"]
+    # 契约形状：note_id / evidence 从 metadata 映射
+    note = result.selected_notes[0]
+    assert note.note_id == note_id_for("key-decisions", "pytest is the test runner")
+    assert note.evidence.scope == "workspace_fingerprint"
+
+
+def test_folds_episodic_and_durable(tmp_path: Path) -> None:
+    store = DurableMemoryStore(tmp_path / "memory")
+    store.promote([("key-decisions", "pytest is the runner")])
+    state = {"episodic_notes": [_state_note("episodic pytest thought")]}
+    result = MemoryRetriever(store=store, state=state).retrieve(MemoryQuery(text="pytest"))
+    texts = {s.text for s in result.selected_notes}
+    assert texts == {"pytest is the runner", "episodic pytest thought"}
