@@ -57,6 +57,7 @@ class TaskState:
     changed_paths: list = field(default_factory=list)
     artifact_graph: dict = field(default_factory=dict)
     evidence_summaries: dict = field(default_factory=dict)
+    verifier_suggestions: list = field(default_factory=list)
 
     @classmethod
     def create(
@@ -101,6 +102,7 @@ class TaskState:
             changed_paths=list(data.get("changed_paths", [])),
             artifact_graph=dict(data.get("artifact_graph", {}) or {}),
             evidence_summaries=dict(data.get("evidence_summaries", {}) or {}),
+            verifier_suggestions=list(data.get("verifier_suggestions", []) or []),
         )
 
     def record_attempt(self) -> "TaskState":
@@ -153,4 +155,5 @@ class TaskState:
             "changed_paths": list(self.changed_paths),
             "artifact_graph": dict(self.artifact_graph),
             "evidence_summaries": dict(self.evidence_summaries),
+            "verifier_suggestions": list(self.verifier_suggestions),
         }

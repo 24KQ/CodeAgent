@@ -15,6 +15,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from firstcoder.context.budget_summary import (
+    context_budget_summary,
+    update_from_orchestrator,
+)
+from firstcoder.harness.final_readiness import reduce_final_readiness_summary
+from firstcoder.harness.governance import reduce_governance_summary
+from firstcoder.harness.verification import reduce_verification_signal
+
 CONTINUE_KIND = "continue"
 TERMINAL_KIND = "terminal"
 TRANSITION_SUMMARY_SCHEMA = "firstcoder.transition_summary.v1"
@@ -96,10 +104,38 @@ def update_evidence_summaries(
 ) -> dict[str, Any]:
     """Fold one trace event into the evidence summaries dict (H9)."""
     summaries = dict(summaries or {})
-    if event.get("event") == "loop_transition":
+    event_name = event.get("event")
+    if event_name == "loop_transition":
         summaries["transition_summary"] = reduce_transition_summary(
             summaries.get("transition_summary", {}), event
         )
-    # P4 leaves: prompt_built / context_orchestrator_decision -> context_budget_summary,
-    # tool_executed -> verification_signal, final_readiness_decision -> final_readiness_summary.
+    elif event_name == "prompt_built":
+        summaries["context_budget_summary"] = context_budget_summary(
+            event.get("prompt_metadata", {})
+        )
+    elif event_name == "context_orchestrator_decision":
+        summaries["context_budget_summary"] = update_from_orchestrator(
+            summaries.get("context_budget_summary", {}), event
+        )
+    elif event_name == "governance_decision":
+        summaries["governance_summary"] = reduce_governance_summary(
+            summaries.get("governance_summary", {}), event
+        )
+    elif event_name == "tool_executed":
+        paths = list(
+            changed_paths
+            or event.get("changed_paths")
+            or event.get("affected_paths")
+            or []
+        )
+        previous_signal = summaries.get("verification_signal", {})
+        verification_signal = reduce_verification_signal(previous_signal, event, paths)
+        # 没有诊断工具名和可识别命令的普通 tool event 不制造空 evidence leaf；
+        # 这样旧调用方仍保持“未处理事件原样透传”的 P1 契约。
+        if verification_signal != previous_signal:
+            summaries["verification_signal"] = verification_signal
+    elif event_name == "final_readiness_decision":
+        summaries["final_readiness_summary"] = reduce_final_readiness_summary(
+            summaries.get("final_readiness_summary", {}), event
+        )
     return summaries

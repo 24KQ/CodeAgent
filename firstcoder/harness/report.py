@@ -22,6 +22,7 @@ def build_report(
     prompt_metadata: dict[str, Any] | None = None,
     compactions: list[dict[str, Any]] | None = None,
     redacted_env: dict[str, Any] | None = None,
+    verifier_suggestions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Assemble the terminal report for a run (H4 field contract)."""
     return {
@@ -42,6 +43,10 @@ def build_report(
         "prompt_metadata": dict(prompt_metadata or {}),
         "compactions": list(compactions or []),
         "redacted_env": dict(redacted_env or {}),
-        # P4 wires the verification pipeline; the field stays in the contract.
-        "verifier_suggestions": [],
+        # P4 将验证建议作为报告数据保存；不在 report builder 内执行命令。
+        "verifier_suggestions": list(
+            verifier_suggestions
+            if verifier_suggestions is not None
+            else getattr(task_state, "verifier_suggestions", [])
+        ),
     }

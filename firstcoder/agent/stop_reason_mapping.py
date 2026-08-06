@@ -24,10 +24,12 @@ from firstcoder.harness.task_state import (
     STOP_REASON_APPROVAL_DENIED,
     STOP_REASON_CANCELLED,
     STOP_REASON_FINAL_ANSWER_RETURNED,
+    STOP_REASON_FINAL_GATE_BLOCKED,
     STOP_REASON_INTERRUPTED,
     STOP_REASON_MODEL_ERROR,
     STOP_REASON_PERSISTENCE_ERROR,
     STOP_REASON_RESUME_LOAD_ERROR,
+    STOP_REASON_RETRY_LIMIT_REACHED,
     STOP_REASON_STEP_LIMIT_REACHED,
     STOP_REASON_TOOL_TIMEOUT,
 )
@@ -38,6 +40,8 @@ _FINISH_REASON_TO_STOP_REASON = {
     AgentLoopStopReason.TOOL_ROUND_LIMIT.value: STOP_REASON_STEP_LIMIT_REACHED,
     AgentLoopStopReason.PROVIDER_CALL_LIMIT.value: STOP_REASON_STEP_LIMIT_REACHED,
     AgentLoopStopReason.TURN_TIMEOUT.value: STOP_REASON_TOOL_TIMEOUT,
+    "retry_limit": STOP_REASON_RETRY_LIMIT_REACHED,
+    "retry_limit_reached": STOP_REASON_RETRY_LIMIT_REACHED,
     "interrupted": STOP_REASON_INTERRUPTED,
     "cancelled": STOP_REASON_CANCELLED,
     "error": STOP_REASON_MODEL_ERROR,
@@ -81,6 +85,8 @@ def map_turn_outcome(
         return STOP_REASON_RESUME_LOAD_ERROR
     if error_type == "provider":
         return STOP_REASON_MODEL_ERROR
+    if error_type in {"final_gate", "final_readiness"}:
+        return STOP_REASON_FINAL_GATE_BLOCKED
     # finish_reason 映射优先于状态分支：任意状态（含 failed / waiting）下
     # limit / timeout / interrupted / cancelled / error 都一致映射
     # （Codex P1 review fix 复验）。
