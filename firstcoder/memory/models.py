@@ -68,6 +68,7 @@ class RetrievalSelection:
     note: MemoryNote
     selected: bool = False
     reject_reason: RejectReason | None = None
+    score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,7 @@ class RetrievalResult:
 
     query: MemoryQuery
     selections: list[RetrievalSelection] = field(default_factory=list)
+    query_hash: str = ""
 
     @property
     def selected_notes(self) -> list[MemoryNote]:
