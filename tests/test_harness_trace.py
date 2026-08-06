@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from firstcoder.harness.run_store import RunStore
 from firstcoder.harness.task_state import TaskState
 from firstcoder.harness.trace import PHASE_BY_EVENT, TraceWriter, build_trace_event
@@ -94,3 +96,24 @@ def test_emitter_fans_out_to_consumers_and_records_errors(tmp_path: Path) -> Non
     assert "consumer boom" in errors[0]["message"]
     # 消费者失败不中断 run，task_state 照常落盘。
     assert store.load_task_state("run_cons")["evidence_summaries"]["runtime_consumer_errors"]
+
+
+def test_critical_consumer_failure_raises_after_persistence(tmp_path: Path) -> None:
+    """critical consumer 失败 = 审计硬失败：错误先落盘，再中断 run（Codex P1 review fix）。"""
+    store = RunStore(tmp_path / "runs")
+    state = TaskState.create("t1", "request", run_id="run_crit")
+
+    class CriticalConsumer:
+        critical = True
+
+        def handle(self, task_state, event) -> None:
+            raise RuntimeError("audit store boom")
+
+    writer = TraceWriter(store, StaticSecurityPolicy(), consumers=[CriticalConsumer()])
+    with pytest.raises(RuntimeError, match="audit store boom"):
+        writer.emit(state, "run_finished")
+    # 异常抛出前 task_state 已落盘，错误记录可审计。
+    persisted = store.load_task_state("run_crit")
+    errors = persisted["evidence_summaries"]["runtime_consumer_errors"]
+    assert errors[0]["consumer"] == "CriticalConsumer"
+    assert errors[0]["critical"] is True

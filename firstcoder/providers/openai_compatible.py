@@ -19,6 +19,7 @@ from firstcoder.providers.streaming import (
     StreamFailure,
     StreamToolCallAccumulator,
     complete_stream_tool_calls,
+    merge_usage,
     read_field as _read_field,
     start_sync_stream_worker,
     token_usage,
@@ -35,6 +36,7 @@ from firstcoder.providers.types import (
     ToolChoice,
     ToolChoiceFunction,
     ToolCall,
+    TokenUsage,
 )
 
 
@@ -165,18 +167,38 @@ class OpenAICompatibleProvider(ChatProvider):
 
         params = self._build_completion_params(request)
         params["stream"] = True
+        # OpenAI / DeepSeek 流式 usage 摘要：最后一个 chunk 携带 usage 且无
+        # choices（Codex P1 review fix）。不认识的兼容端点会拒绝该字段，
+        # create 失败时降级为不带 usage 重试一次。
+        params["stream_options"] = {"include_usage": True}
         diagnostics = ProviderDiagnostics()
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_accumulators: dict[int, StreamToolCallAccumulator] = {}
         raw_finish_reason: Any = None
         response_model = self._model
+        usage: TokenUsage | None = None
 
         try:
             stream = await asyncio.to_thread(self._client.chat.completions.create, **params)
         except Exception as exc:
-            message = str(exc)
-            raise ProviderError(classify_provider_exception(exc), message) from exc
+            if not params.get("stream_options"):
+                raise ProviderError(classify_provider_exception(exc), str(exc)) from exc
+            # 只对明确表示不识别 stream_options 的参数错误降级（错误消息含该
+            # 字段名）；认证/限流/网络等错误直接抛出，避免重复请求与重复计费
+            # （Codex P1 review fix 复验）。流迭代阶段才拒绝的端点不会触发
+            # 这里的降级——留待接线时评估。
+            lowered = str(exc).lower()
+            if "stream_options" not in lowered and "include_usage" not in lowered:
+                raise ProviderError(classify_provider_exception(exc), str(exc)) from exc
+            params.pop("stream_options", None)
+            diagnostics.warnings.append(
+                "provider rejected stream_options.include_usage; streaming usage unavailable"
+            )
+            try:
+                stream = await asyncio.to_thread(self._client.chat.completions.create, **params)
+            except Exception as retry_exc:
+                raise ProviderError(classify_provider_exception(retry_exc), str(retry_exc)) from retry_exc
 
         yield ChatStreamEvent(kind="message_started")
 
@@ -201,6 +223,13 @@ class OpenAICompatibleProvider(ChatProvider):
                     diagnostics.warnings.append(stream_error.message)
                     yield ChatStreamEvent(kind="error", diagnostics=diagnostics)
                     raise stream_error
+
+                # usage 摘要 chunk 没有 choices，必须在 choices 判断之前解析；
+                # 多 chunk 携带 usage 时逐个合并（Codex P1 review fix）。
+                chunk_usage = _read_field(chunk, "usage")
+                if chunk_usage is not None:
+                    parsed_usage = _parse_usage(chunk_usage)
+                    usage = parsed_usage if usage is None else merge_usage(usage, parsed_usage)
 
                 response_model = _read_field(chunk, "model", response_model) or response_model
                 choices = _read_field(chunk, "choices", []) or []
@@ -267,6 +296,7 @@ class OpenAICompatibleProvider(ChatProvider):
             content="".join(content_parts),
             tool_calls=tool_calls,
             finish_reason=finish_reason,
+            usage=usage,
             diagnostics=diagnostics,
         )
         yield ChatStreamEvent(kind="message_completed", response=response, diagnostics=diagnostics)
@@ -395,8 +425,8 @@ def _parse_usage(usage: Any):
     cached = _read_field(usage, "cached_tokens")
     if cached is None:
         details = _read_field(usage, "prompt_tokens_details")
-        if isinstance(details, dict):
-            cached = details.get("cached_tokens")
+        # 官方 SDK 返回对象而非 dict：read_field 两者都兼容（Codex P1 review fix）。
+        cached = _read_field(details, "cached_tokens")
     return token_usage(input_tokens, output_tokens, total_tokens, cached)
 
 

@@ -41,9 +41,15 @@ class MemoryPromotionPolicy(Protocol):
 
 
 class MemorySecurityPolicy(Protocol):
-    """Static security rules: secret patterns, quarantine gate, redaction."""
+    """Static security rules: secret patterns, quarantine gate, redaction.
+
+    `redact_artifact` is the recursive redaction used by the harness
+    `TraceWriter` before persistence (Codex P1 review fix: the protocol
+    must declare what the emitter actually calls).
+    """
 
     def redact(self, text: str) -> str: ...
+    def redact_artifact(self, value: Any, key: str | None = None) -> Any: ...
     def passes_quarantine(self, note: MemoryNote) -> bool: ...
 
 

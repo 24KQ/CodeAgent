@@ -745,6 +745,167 @@ def test_provider_usage_normalizes_to_shared_token_usage(provider_kind) -> None:
     assert response.usage == expected
 
 
+def test_openai_parse_usage_reads_cached_from_details_object() -> None:
+    """官方 SDK 的 prompt_tokens_details 是对象而非 dict（Codex P1 review fix）。"""
+    from firstcoder.providers.openai_compatible import _parse_usage
+
+    usage = _parse_usage(
+        _Object(
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+            prompt_tokens_details=_Object(cached_tokens=4),
+        )
+    )
+    assert usage.input_tokens == 10
+    assert usage.cached_input_tokens == 4
+
+
+class _FakeOpenAIUsageStreamCompletions:
+    def __init__(self):
+        self.last_params = None
+
+    def create(self, **params):
+        self.last_params = params
+        return iter(
+            [
+                _Object(model=params["model"], choices=[_Object(delta=_Object(content="hi"), finish_reason=None)]),
+                _Object(model=params["model"], choices=[_Object(delta={}, finish_reason="stop")]),
+                # usage 摘要 chunk：没有 choices，只有 usage（Codex P1 review fix）。
+                _Object(
+                    model=params["model"],
+                    usage=_Object(
+                        prompt_tokens=11,
+                        completion_tokens=7,
+                        total_tokens=18,
+                        prompt_tokens_details=_Object(cached_tokens=3),
+                    ),
+                ),
+            ]
+        )
+
+
+class _FakeOpenAIUsageStreamClient:
+    def __init__(self):
+        self.completions = _FakeOpenAIUsageStreamCompletions()
+        self.chat = _Object(completions=self.completions)
+
+
+def test_openai_compatible_provider_parses_streaming_usage() -> None:
+    async def collect_events():
+        client = _FakeOpenAIUsageStreamClient()
+        provider = OpenAICompatibleProvider(
+            name="test-openai",
+            model="test-model",
+            api_key="test-key",
+            client=client,
+        )
+        events = [event async for event in provider.astream(ChatRequest(messages=[ChatMessage(role="user", content="hi")]))]
+        return client, events
+
+    client, events = asyncio.run(collect_events())
+    assert client.completions.last_params["stream_options"] == {"include_usage": True}
+    completed = events[-1]
+    assert completed.kind == "message_completed"
+    assert completed.response.usage == TokenUsage(
+        input_tokens=11, output_tokens=7, total_tokens=18, cached_input_tokens=3
+    )
+
+
+class _FakeOpenAIStreamOptionsFallbackCompletions:
+    """模拟不识别 stream_options 的兼容端点。
+
+    第一次 create 抛参数错误（错误消息含 stream_options 关键词），
+    第二次调用（降级重试，已移除 stream_options）成功返回正常 chunk
+    流。用于验证：只有消息含 stream_options / include_usage 的错误
+    才触发降级，且降级后不再携带该参数。
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    def create(self, **params):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("BadRequest: unknown parameter 'stream_options'")
+        return iter(
+            [
+                _Object(model=params["model"], choices=[_Object(delta=_Object(content="hi"), finish_reason=None)]),
+                _Object(model=params["model"], choices=[_Object(delta={}, finish_reason="stop")]),
+            ]
+        )
+
+
+def test_openai_compatible_provider_falls_back_when_stream_options_rejected() -> None:
+    async def collect_events():
+        client = _FakeOpenAIStreamOptionsFallbackClient()
+        provider = OpenAICompatibleProvider(
+            name="test-openai",
+            model="test-model",
+            api_key="test-key",
+            client=client,
+        )
+        events = [event async for event in provider.astream(ChatRequest(messages=[ChatMessage(role="user", content="hi")]))]
+        return client, events
+
+    client, events = asyncio.run(collect_events())
+    assert client.completions.calls == 2  # 降级重试一次
+    assert any("streaming usage unavailable" in warning for warning in events[-1].diagnostics.warnings)
+    assert events[-1].response.content == "hi"
+
+
+class _FakeOpenAIStreamOptionsFallbackClient:
+    def __init__(self):
+        self.completions = _FakeOpenAIStreamOptionsFallbackCompletions()
+        self.chat = _Object(completions=self.completions)
+
+
+class _FakeOpenAIAuthFailStreamCompletions:
+    """模拟认证失败端点：错误消息不含 stream_options 关键词。
+
+    用于验证：非参数类错误（认证/限流/网络）必须直接抛出、不做降级
+    重试，避免重复请求与重复计费。
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    def create(self, **params):
+        self.calls += 1
+        raise RuntimeError("401 Unauthorized: invalid api key")
+
+
+def test_openai_compatible_provider_does_not_retry_on_unrelated_stream_error() -> None:
+    """认证/网络等错误不带 stream_options 关键词时直接抛出，不重复请求
+    （Codex P1 review fix 复验）。"""
+
+    async def collect_events():
+        client = _FakeOpenAIAuthFailStreamClient()
+        provider = OpenAICompatibleProvider(
+            name="test-openai",
+            model="test-model",
+            api_key="test-key",
+            client=client,
+        )
+        events = []
+        try:
+            async for event in provider.astream(ChatRequest(messages=[ChatMessage(role="user", content="hi")])):
+                events.append(event)
+        except ProviderError as exc:
+            return client, events, exc
+        return client, events, None
+
+    client, _events, exc = asyncio.run(collect_events())
+    assert client.completions.calls == 1  # 未重试
+    assert exc is not None
+
+
+class _FakeOpenAIAuthFailStreamClient:
+    def __init__(self):
+        self.completions = _FakeOpenAIAuthFailStreamCompletions()
+        self.chat = _Object(completions=self.completions)
+
+
 def test_openai_compatible_provider_parses_tool_calls():
     client = _FakeOpenAIClient()
     provider = OpenAICompatibleProvider(
