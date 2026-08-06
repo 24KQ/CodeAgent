@@ -1,0 +1,15 @@
+# FirstCoder 项目级配置：使用 DeepSeek 的 OpenAI 兼容接口。
+# API Key 放在 .env 文件的 DEEPSEEK_API_KEY 里（.env 已被 gitignore）。
+default_model = "deepseek/deepseek-chat"
+
+[providers.deepseek]
+type = "openai-compatible"
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[models."deepseek/deepseek-chat"]
+label = "DeepSeek Chat"
+context_window = 65536
+
+[permissions]
+mode = "ask"

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "firstcoder"
+version = "0.1.12"
+description = "A local Python coding agent with a Textual TUI."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "textual",
+    "prompt_toolkit",
+    "openai",
+    "anthropic",
+    "anyio",
+    "mcp>=1.28.1,<2",
+    "python-dotenv",
+    "PyYAML",
+    "tomlkit",
+    "portalocker",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+firstcoder = "firstcoder.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["firstcoder*"]
+
+[tool.setuptools.package-data]
+firstcoder = ["context/prompts/*.md", "app/*.tcss"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 200
+target-version = ["py311"]
