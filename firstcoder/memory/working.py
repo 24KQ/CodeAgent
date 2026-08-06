@@ -1,9 +1,14 @@
-"""Working-memory pure transforms (fusion P2, M2).
+"""Working-memory transforms (fusion P2, M2).
 
 Ported from pico `features/memory.py:744-830, 1186-1420` and
-`core/workspace.py:26` (`clip`). Every function is a pure
-state -> state transformation: normalize first, then mutate, always
-keeping the legacy mirror fields (`task` / `files` / `notes`) in sync.
+`core/workspace.py:26` (`clip`). Every function is a pure in-memory
+state transform: normalize first, then mutate, always keeping the
+legacy mirror fields (`task` / `files` / `notes`) in sync.
+
+声明边界（Codex P2 review #9）：变换不落盘，但 `normalize_memory_state`
+会**原地规范化**传入的 dict（并可能在提供 `workspace_root` 时构造只读
+store 读取 `durable_topics`）——调用方若需保留原状态应传入副本。
+所谓"纯"指不持久化、无外部副作用，不是输入不可变。
 
 FirstCoder adaptations:
 

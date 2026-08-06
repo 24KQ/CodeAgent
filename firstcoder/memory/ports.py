@@ -9,6 +9,7 @@ P6 auto-dream).
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Protocol
 
 from firstcoder.memory.models import (
@@ -21,9 +22,13 @@ from firstcoder.memory.models import (
 
 
 class MemoryStorePort(Protocol):
-    """Durable memory storage: daily logs, topic notes, metadata index."""
+    """Durable memory storage: daily logs, topic notes, metadata index.
 
-    def append_daily_log(self, text: str, *, source: MemoryEvidence) -> None: ...
+    签名与 `DurableMemoryStore` 实现对齐（Codex P2 review #8）：daily log
+    返回写入路径，evidence 可缺省。
+    """
+
+    def append_daily_log(self, text: str, *, source: MemoryEvidence | None = None) -> Path | None: ...
     def upsert_topic(self, note: MemoryNote) -> None: ...
     def read_index(self) -> list[MemoryNote]: ...
 

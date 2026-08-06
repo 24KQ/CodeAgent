@@ -149,3 +149,61 @@ def test_folds_episodic_and_durable(tmp_path: Path) -> None:
     result = MemoryRetriever(store=store, state=state).retrieve(MemoryQuery(text="pytest"))
     texts = {s.text for s in result.selected_notes}
     assert texts == {"pytest is the runner", "episodic pytest thought"}
+
+
+def test_zh_query_recalls_zh_note() -> None:
+    """中文 query 子串可召回（Codex P2 review #6：bigram 分词）。"""
+    state = {"episodic_notes": [_state_note("单元测试很快")]}
+    result = _retriever(state).retrieve(MemoryQuery(text="测试"))
+    assert [s.text for s in result.selected_notes] == ["单元测试很快"]
+
+
+def test_zh_exact_tag_and_recall() -> None:
+    state = {
+        "episodic_notes": [
+            _state_note("完全无关的英文", note_index=0),
+            _state_note("关于 Python 的一切", tags=["pytest"], note_index=1),
+        ]
+    }
+    result = _retriever(state).retrieve(MemoryQuery(text="pytest"))
+    assert [s.text for s in result.selected_notes] == ["关于 Python 的一切"]
+
+
+def test_scope_fingerprint_isolation(tmp_path: Path) -> None:
+    """workspace A 的记忆在 workspace B 被拒（Codex P2 review #5）。"""
+    ws_a = tmp_path / "ws_a"
+    ws_b = tmp_path / "ws_b"
+    ws_a.mkdir()
+    ws_b.mkdir()
+    store = DurableMemoryStore(tmp_path / "memory", workspace_root=ws_a)
+    store.promote([("key-decisions", "pytest is the runner")])
+
+    # 同 workspace 命中
+    same = MemoryRetriever(store=store, workspace_root=str(ws_a)).retrieve(MemoryQuery(text="pytest"))
+    assert [s.text for s in same.selected_notes] == ["pytest is the runner"]
+
+    # 跨 workspace 拒绝（scope_mismatch）
+    other = MemoryRetriever(store=store, workspace_root=str(ws_b)).retrieve(MemoryQuery(text="pytest"))
+    assert other.selected_notes == []
+    assert other.selections[0].reject_reason == "scope_mismatch"
+
+
+def test_global_scope_always_selected(tmp_path: Path) -> None:
+    state = {"episodic_notes": [_state_note("pytest note", scope="global")]}
+    result = _retriever(state).retrieve(MemoryQuery(text="pytest"))
+    assert [s.text for s in result.selected_notes] == ["pytest note"]
+
+
+def test_score_monotone_with_ranking() -> None:
+    """score 与排序方向一致：exact tag 的分数高于 keyword-only（Codex P2 review #8）。"""
+    state = {
+        "episodic_notes": [
+            _state_note("pytest is fast", note_index=0),
+            _state_note("关于 python 的一切", tags=["pytest"], note_index=1),
+        ]
+    }
+    result = _retriever(state).retrieve(MemoryQuery(text="pytest"))
+    scores = [s.score for s in result.selections]
+    assert scores == sorted(scores, reverse=True)
+    assert scores[0] >= 1000
+    assert scores[1] < 1000

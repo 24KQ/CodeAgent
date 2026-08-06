@@ -3,15 +3,22 @@
 Ported verbatim from pico `features/memory.py:38-50, 562-613`. Pure static
 rules: intent patterns gate promotion, line patterns pick note text,
 rejection reasons classify bad candidates. Zero runtime dependencies.
+
+判定链路：用户消息带记忆意图（英文或中文关键词）→ 逐行匹配主题模式
+（Decision:/决策：等）→ 拒绝原因分类（secret/瞬态/噪声）→ 通过的
+(topic, note_text) 交给 durable.promote 落盘。
 """
 
 from __future__ import annotations
 
 import re
 
+#: 记忆意图触发词：英文 + 中文（任一命中才开始提取）。
 DURABLE_MEMORY_INTENT_PATTERN = re.compile(r"(?i)\b(capture|remember|save|store|persist|note)\b")
 DURABLE_MEMORY_INTENT_ZH_PATTERN = re.compile(r"(记住|保存|记录|沉淀|长期记忆|持久记忆)")
+#: 列表前缀（"- " / "* " / "1. "），提取正文前剥掉。
 DURABLE_MEMORY_LIST_PREFIX_PATTERN = re.compile(r"^(?:[-*]|\d+[.)])\s+")
+#: 主题行模式：英文六条 + 中文四条，顺序即匹配优先级（同一行只会命中第一条）。
 DURABLE_MEMORY_LINE_PATTERNS = (
     ("project-conventions", re.compile(r"(?i)^Project convention:\s*(.+)$")),
     ("key-decisions", re.compile(r"(?i)^Decision:\s*(.+)$")),

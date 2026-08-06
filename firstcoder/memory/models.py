@@ -18,6 +18,13 @@ RejectReason = Literal[
     "relative_date",
     "missing_evidence",
     "too_trivial",
+    # retrieval 实际产生的拒绝原因（Codex P2 review #8：契约声明
+    # 必须覆盖实现产生并写入 audit trail 的全部值）
+    "quarantined",
+    "superseded",
+    "stale_evidence",
+    "scope_mismatch",
+    "below_limit",
 ]
 
 

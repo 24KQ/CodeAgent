@@ -21,11 +21,25 @@ from firstcoder.memory.models import (
     RetrievalResult,
     RetrievalSelection,
 )
-from firstcoder.memory.provenance import apply_evidence_staleness
+from firstcoder.memory.provenance import apply_evidence_staleness, workspace_fingerprint
 
 
 def _tokenize(text: str) -> set[str]:
-    return {token.lower() for token in re.findall(r"[A-Za-z0-9_]+", str(text))}
+    """分词：ASCII 词 + 中文连续块按 bigram 切分（Codex P2 review #6）。
+
+    连续中文整段作一个 token 时，query 子串（如"测试" vs 笔记里的
+    "单元测试"）无法重叠召回；按 2-gram 切分让子串匹配成为可能。
+    单字块保留原字（"是"等虚词可能带来少量假重叠，可接受）。
+    """
+    raw = str(text)
+    tokens = {token.lower() for token in re.findall(r"[A-Za-z0-9_]+", raw)}
+    for block in re.findall(r"[一-鿿]+", raw):
+        if len(block) == 1:
+            tokens.add(block)
+        else:
+            for i in range(len(block) - 1):
+                tokens.add(block[i : i + 2])
+    return tokens
 
 
 def _parse_timestamp(value: str) -> float:
@@ -71,8 +85,16 @@ def _retrieval_reject_reason(note: dict, workspace_root: str | None = None) -> s
     if bool(note.get("stale_evidence")):
         return "stale_evidence"
     scope = str(note.get("scope", "")).strip()
-    if scope and scope not in {"workspace_fingerprint", "global"}:
-        return "scope_mismatch"
+    if scope and scope != "global":
+        if scope == "workspace_fingerprint":
+            pass  # 字面量标记（无 workspace 上下文写入的兼容值）：不比较
+        elif workspace_root is not None and re.fullmatch(r"[0-9a-f]{12}", scope):
+            # 真实 fingerprint：必须与当前 workspace 一致，否则跨 workspace
+            # 记忆泄漏（Codex P2 review #5）。
+            if scope != workspace_fingerprint(workspace_root):
+                return "scope_mismatch"
+        else:
+            return "scope_mismatch"
     if bool(note.get("scope_mismatch")):
         return "scope_mismatch"
     return ""
@@ -116,7 +138,16 @@ class MemoryRetriever:
                 continue
             recency = _parse_timestamp(note.get("created_at"))
             note_index = int(note.get("note_index", 0))
-            score = exact_tag_match * 1000 + keyword_overlap * 10 + recency / 1_000_000 + note_index / 1_000_000_000
+            # 排序以 tuple 键 (exact_tag, keyword_overlap, recency, note_index)
+            # 为准；score 是与排序方向一致的启发式审计值（Codex P2 review #8）：
+            # recency 归一化到 <10，避免 epoch 秒数（~1.7e9）盖过 keyword 权重，
+            # 让审计里"分数更高"始终对应"排序更靠前"。
+            score = (
+                exact_tag_match * 1000
+                + keyword_overlap * 10
+                + min(recency / 1_000_000_000, 0.999)
+                + min(note_index / 1_000_000_000, 0.001)
+            )
             ranked.append(((exact_tag_match, keyword_overlap, recency, note_index), score, note))
         ranked.sort(key=lambda item: item[0], reverse=True)
         return ranked

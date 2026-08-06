@@ -4,6 +4,9 @@ Ported from pico `features/memory.py:78-110` with the M1 write-upgrade:
 the append is now a locked read-modify-write through
 `firstcoder.memory.write.locked_append_line` (Codex TOCTOU finding), so
 concurrent processes cannot lose or interleave entries.
+
+声明边界：本模块只管 daily log 的目录/路径/追加，不做任何内容判定；
+secrets 判定与 quarantine 在 security.py，evidence 侧车在 durable.py。
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ _EMPTY_INDEX = (
 
 
 def ensure_memory_dir(memory_dir: str | Path) -> Path:
+    """确保 memory 目录骨架存在（logs/topics/index），缺失时原子创建。"""
     memory_dir = Path(memory_dir)
     memory_dir.mkdir(parents=True, exist_ok=True)
     (memory_dir / "logs").mkdir(parents=True, exist_ok=True)
@@ -34,6 +38,7 @@ def ensure_memory_dir(memory_dir: str | Path) -> Path:
 
 
 def daily_log_path(memory_dir: str | Path, today: date | None = None) -> Path:
+    """当日日志路径：`logs/<year>/<month>/<date>.md`，父目录自动创建。"""
     today = today or date.today()
     memory_dir = ensure_memory_dir(memory_dir)
     path = memory_dir / "logs" / str(today.year) / f"{today.month:02d}" / f"{today.isoformat()}.md"
@@ -46,6 +51,7 @@ def append_to_daily_log(
     entry: str,
     today: date | None = None,
 ) -> Path | None:
+    """追加一条带时间戳的日志行（加锁读改写，防并发丢失）；空 entry 返回 None。"""
     entry = str(entry).strip()
     if not entry:
         return None
