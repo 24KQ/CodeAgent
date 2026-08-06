@@ -54,11 +54,15 @@ class TokenUsage:
     """provider 返回的 token 用量。
 
     不同 OpenAI-compatible 厂商返回字段可能不完整，所以这里允许局部为空。
+    `cached_input_tokens` 是 P1 provider-call metadata contract 的前置字段
+    （§7.3）：OpenAI 的 prompt_tokens_details.cached_tokens / Anthropic 的
+    cache_read_input_tokens 都落在这里。
     """
 
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    cached_input_tokens: int | None = None
 
 
 @dataclass(slots=True)

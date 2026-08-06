@@ -537,4 +537,5 @@ def _parse_usage(usage: Any):
         return None
     input_tokens = _read_field(usage, "input_tokens")
     output_tokens = _read_field(usage, "output_tokens")
-    return token_usage(input_tokens, output_tokens, _read_field(usage, "total_tokens"))
+    cached = _read_field(usage, "cache_read_input_tokens")
+    return token_usage(input_tokens, output_tokens, _read_field(usage, "total_tokens"), cached)

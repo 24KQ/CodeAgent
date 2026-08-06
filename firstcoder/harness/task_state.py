@@ -1,0 +1,156 @@
+"""TaskState snapshot for one run (fusion P1, H2).
+
+Ported from pico `core/task_state.py` with the §7.3 field enhancements:
+`session_id`, `schema_version`, `workspace_fingerprint`, `parent_run_id`.
+Tracks where a user request is in the runtime, how much work it has done,
+what evidence was collected, and why it stopped. Persisted during the run
+for live inspection and post-run review.
+
+Pure dataclass, zero external imports beyond stdlib — the cleanest layer
+of the harness contract.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from uuid import uuid4
+
+TASK_STATE_SCHEMA_VERSION = 1
+
+STATUS_RUNNING = "running"
+STATUS_COMPLETED = "completed"
+STATUS_STOPPED = "stopped"
+STATUS_FAILED = "failed"
+
+STOP_REASON_FINAL_ANSWER_RETURNED = "final_answer_returned"
+STOP_REASON_STEP_LIMIT_REACHED = "step_limit_reached"
+STOP_REASON_RETRY_LIMIT_REACHED = "retry_limit_reached"
+STOP_REASON_MODEL_ERROR = "model_error"
+STOP_REASON_TOOL_TIMEOUT = "tool_timeout"
+STOP_REASON_APPROVAL_DENIED = "approval_denied"
+STOP_REASON_PERSISTENCE_ERROR = "persistence_error"
+STOP_REASON_RESUME_LOAD_ERROR = "resume_load_error"
+STOP_REASON_FINAL_GATE_BLOCKED = "final_gate_blocked"
+#: FirstCoder additions to the pico enum (docs/fusion-plan-review.md §7.3).
+STOP_REASON_CANCELLED = "cancelled"
+STOP_REASON_INTERRUPTED = "interrupted"
+
+
+@dataclass
+class TaskState:
+    run_id: str
+    task_id: str
+    user_request: str
+    session_id: str = ""
+    schema_version: int = TASK_STATE_SCHEMA_VERSION
+    workspace_fingerprint: str = ""
+    parent_run_id: str = ""
+    status: str = STATUS_RUNNING
+    tool_steps: int = 0
+    attempts: int = 0
+    last_tool: str = ""
+    stop_reason: str = ""
+    final_answer: str = ""
+    checkpoint_id: str = ""
+    resume_status: str = ""
+    changed_paths: list = field(default_factory=list)
+    artifact_graph: dict = field(default_factory=dict)
+    evidence_summaries: dict = field(default_factory=dict)
+
+    @classmethod
+    def create(
+        cls,
+        task_id: str,
+        user_request: str,
+        *,
+        run_id: str = "",
+        session_id: str = "",
+        workspace_fingerprint: str = "",
+        parent_run_id: str = "",
+    ) -> "TaskState":
+        if not run_id:
+            run_id = "run_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:6]
+        return cls(
+            run_id=run_id,
+            task_id=task_id,
+            user_request=user_request,
+            session_id=session_id,
+            workspace_fingerprint=workspace_fingerprint,
+            parent_run_id=parent_run_id,
+        )
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TaskState":
+        return cls(
+            run_id=str(data.get("run_id", "")),
+            task_id=str(data.get("task_id", "")),
+            user_request=str(data.get("user_request", "")),
+            session_id=str(data.get("session_id", "")),
+            schema_version=int(data.get("schema_version", TASK_STATE_SCHEMA_VERSION) or TASK_STATE_SCHEMA_VERSION),
+            workspace_fingerprint=str(data.get("workspace_fingerprint", "")),
+            parent_run_id=str(data.get("parent_run_id", "")),
+            status=str(data.get("status", STATUS_RUNNING)),
+            tool_steps=int(data.get("tool_steps", 0)),
+            attempts=int(data.get("attempts", 0)),
+            last_tool=str(data.get("last_tool", "")),
+            stop_reason=str(data.get("stop_reason", "")),
+            final_answer=str(data.get("final_answer", "")),
+            checkpoint_id=str(data.get("checkpoint_id", "")),
+            resume_status=str(data.get("resume_status", "")),
+            changed_paths=list(data.get("changed_paths", [])),
+            artifact_graph=dict(data.get("artifact_graph", {}) or {}),
+            evidence_summaries=dict(data.get("evidence_summaries", {}) or {}),
+        )
+
+    def record_attempt(self) -> "TaskState":
+        # attempt 统计的是"模型被调用了几轮"，不等于 tool_steps。
+        self.attempts += 1
+        return self
+
+    def record_tool(self, name: str) -> "TaskState":
+        # tool_steps 只统计真正进入执行阶段的工具调用次数。
+        self.tool_steps += 1
+        self.last_tool = str(name or "")
+        return self
+
+    def finish_success(self, final_answer: str) -> "TaskState":
+        self.status = STATUS_COMPLETED
+        self.stop_reason = STOP_REASON_FINAL_ANSWER_RETURNED
+        self.final_answer = str(final_answer)
+        return self
+
+    def stop(
+        self,
+        stop_reason: str,
+        status: str = STATUS_STOPPED,
+        final_answer: str = "",
+    ) -> "TaskState":
+        # stop_reason 和 status 分开存，是为了区分"怎么停的"和"停下时是什么状态"。
+        self.status = status
+        self.stop_reason = stop_reason
+        if final_answer != "":
+            self.final_answer = final_answer
+        return self
+
+    def to_dict(self) -> dict:
+        return {
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "user_request": self.user_request,
+            "session_id": self.session_id,
+            "schema_version": self.schema_version,
+            "workspace_fingerprint": self.workspace_fingerprint,
+            "parent_run_id": self.parent_run_id,
+            "status": self.status,
+            "tool_steps": self.tool_steps,
+            "attempts": self.attempts,
+            "last_tool": self.last_tool,
+            "stop_reason": self.stop_reason,
+            "final_answer": self.final_answer,
+            "checkpoint_id": self.checkpoint_id,
+            "resume_status": self.resume_status,
+            "changed_paths": list(self.changed_paths),
+            "artifact_graph": dict(self.artifact_graph),
+            "evidence_summaries": dict(self.evidence_summaries),
+        }
