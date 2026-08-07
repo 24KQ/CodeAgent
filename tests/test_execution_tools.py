@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 from firstcoder.agent.session import create_project_permission_manager
 from firstcoder.permissions.types import PermissionMode
-from firstcoder.tools.diagnostics import create_diagnostics_tool
-from firstcoder.tools.python_exec import create_python_exec_tool
-from firstcoder.tools.shell import create_shell_tool
 from firstcoder.tools import create_builtin_registry
 from firstcoder.tools.permission_registry import PermissionAwareToolRegistry
 from firstcoder.utils.subprocess import CommandResult
+
+
+def _python_shell_command(code: str) -> str:
+    """把 Python 代码编码成可交给 shell 工具的跨平台命令字符串。
+
+    测试的目标是 shell 工具的超时和输出处理，而不是验证某个 POSIX
+    shell 内置命令是否存在。因此使用 Python 标准库生成命令行，避免
+    Windows 的 cmd.exe 缺少 sleep/printf 时把平台差异误判为产品回归。
+    """
+
+    return subprocess.list2cmdline([sys.executable, "-c", code])
 
 
 def test_shell_executes_command_inside_root(tmp_path):
@@ -45,7 +56,10 @@ def test_shell_rejects_cwd_outside_root(tmp_path):
 def test_shell_handles_timeout(tmp_path):
     registry = create_builtin_registry(tmp_path, include_execution_tools=True)
 
-    result = registry.execute("shell", {"command": "sleep 999", "timeout_seconds": 1})
+    # Python 的 sleep 在 Windows 与 POSIX 环境中语义一致，仍由 shell
+    # 工具启动，从而保留对工具超时和进程回收行为的覆盖。
+    command = _python_shell_command("import time; time.sleep(999)")
+    result = registry.execute("shell", {"command": command, "timeout_seconds": 1})
 
     assert result.ok is False
     assert result.error == "命令执行超时"
@@ -90,7 +104,10 @@ def test_shell_rejects_non_positive_limits(tmp_path):
 def test_shell_truncates_large_stdout(tmp_path):
     registry = create_builtin_registry(tmp_path, include_execution_tools=True)
 
-    result = registry.execute("shell", {"command": "printf abcdef", "max_output_chars": 3})
+    # print(..., end="") 明确不追加换行，等价于原来的 printf 夹具，
+    # 但不依赖当前操作系统的 shell 内置命令集合。
+    command = _python_shell_command("print('abcdef', end='')")
+    result = registry.execute("shell", {"command": command, "max_output_chars": 3})
 
     assert result.ok is True
     assert result.data["stdout"] == "abc\n\n[输出已截断]"
