@@ -49,6 +49,7 @@ class SessionBootstrap:
             tools=self.resolve_tools(),
             permission_manager=self.permission_manager(),
             sandbox_access=self.sandbox_access,
+            workspace_root=self.project_root,
         )
 
     def resume(self, session_id: str) -> AgentSession:
@@ -60,6 +61,7 @@ class SessionBootstrap:
             tools=self.resolve_tools(),
             permission_manager=self.permission_manager(),
             sandbox_access=self.sandbox_access,
+            workspace_root=self.project_root,
         )
 
     def from_project(self, *, session_id: str | None = None) -> AgentSession:
@@ -70,4 +72,5 @@ class SessionBootstrap:
             tools=self.resolve_tools(),
             permission_manager=self.permission_manager(),
             sandbox_access=self.sandbox_access,
+            workspace_root=self.project_root,
         )

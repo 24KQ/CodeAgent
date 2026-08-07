@@ -356,6 +356,9 @@ class SubagentRunner:
             tools=self._supplied_tools_for_child(profile.role),
             permission_manager=self.permission_manager,
             sandbox_access=self.sandbox_access,
+            # inline child 与父项目共享 workspace 记忆；若 runner 未绑定项目，
+            # AgentSession 会按 store root 进行兼容推导。
+            workspace_root=self.project_root,
         )
         child.writer.append_session_metadata_updated(
             parent_session_id=request.parent_session_id,
@@ -403,6 +406,9 @@ class SubagentRunner:
             tools=self._worktree_child_tools(worktree.path, profile=profile, access=sandbox_access, for_registry=True),
             permission_manager=permission_manager,
             sandbox_access=sandbox_access,
+            # 隔离 worktree 必须拥有自己的 workspace scope，避免 child memory
+            # 工具把内容写回父项目的 durable store。
+            workspace_root=worktree.path,
         )
         # Background isolated coder has no interactive user, so per-write review
         # confirmations would deadlock the job.  The worktree diff is reviewed by the

@@ -28,6 +28,8 @@ from firstcoder.agent.user_input import AgentTurnStatus
 from firstcoder.runtime.user_input import UserInputRequest
 from firstcoder.context.context_builder import ContextBuilder
 from firstcoder.context.models import AgentMessage, MessagePart, SessionView
+from firstcoder.memory.prompt import MemoryProjector
+from firstcoder.memory.runtime import MemoryRuntime
 from firstcoder.context.runtime_state import SessionRuntimeState
 from firstcoder.permissions.types import PermissionMode
 from firstcoder.providers.base import ChatProvider
@@ -63,6 +65,18 @@ class CurrentSessionState:
 
     def rebuild_view(self) -> SessionView:
         return self.session.rebuild_view()
+
+    @property
+    def memory_runtime(self) -> MemoryRuntime:
+        """当前 session 绑定的 memory 写入 facade。"""
+
+        return self.session.memory_runtime
+
+    @property
+    def memory_projector(self) -> MemoryProjector:
+        """当前 session 绑定的动态 memory projector。"""
+
+        return self.session.memory_projector
 
     @property
     def mode(self) -> str:

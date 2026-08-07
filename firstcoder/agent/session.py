@@ -37,6 +37,11 @@ from firstcoder.tools.session_registry import ToolRegistryLike, create_session_t
 from firstcoder.tools.types import Tool, ToolResult, make_error_result
 from firstcoder.context.models import AgentMessage, MessagePart, SessionView
 from firstcoder.input.attachments import UserAttachment, prepare_attachments_for_session
+from firstcoder.memory.durable import DurableMemoryStore
+from firstcoder.memory.paths import default_memory_root
+from firstcoder.memory.prompt import MemoryProjector
+from firstcoder.memory.redact import MemoryRedactor
+from firstcoder.memory.runtime import MemoryRuntime
 from firstcoder.utils.sandbox_access import SandboxAccess, SandboxAccessMode
 from firstcoder.skills.discovery import discover_all_skills
 from firstcoder.skills.catalog import render_skill_catalog
@@ -82,6 +87,10 @@ class AgentSession:
     runtime_state: SessionRuntimeState
     tool_registry: ToolRegistryLike
     writer: SessionEventWriter
+    memory_store: DurableMemoryStore
+    memory_runtime: MemoryRuntime
+    memory_projector: MemoryProjector
+    memory_redactor: MemoryRedactor
     agents_md: str = ""
     skill_catalog: SkillCatalog = field(default_factory=SkillCatalog)
     base_rules: str = DEFAULT_BASE_RULES
@@ -111,6 +120,7 @@ class AgentSession:
         tools: list[Tool] | None = None,
         permission_manager: PermissionManager | None = None,
         sandbox_access: SandboxAccess | None = None,
+        workspace_root: str | Path | None = None,
     ) -> "AgentSession":
         """创建全新 session，并初始化 session-scoped 工具。
 
@@ -121,6 +131,12 @@ class AgentSession:
         runtime_state = SessionRuntimeState(session_id=session_id)
         known_message_ids: set[str] = set()
         writer = SessionEventWriter(store=store, session_id=session_id)
+        memory_store, memory_runtime, memory_projector, memory_redactor = _build_memory_components(
+            store=store,
+            session_id=session_id,
+            workspace_root=workspace_root,
+            writer=writer,
+        )
         registry = create_session_tool_registry(
             session_id=session_id,
             runtime_state=runtime_state,
@@ -133,6 +149,7 @@ class AgentSession:
             store=store,
             writer=writer,
             skill_catalog=(skill_catalog or SkillCatalog()).resolved(),
+            memory_runtime=memory_runtime,
         )
         session = cls(
             session_id=session_id,
@@ -140,6 +157,10 @@ class AgentSession:
             runtime_state=runtime_state,
             tool_registry=registry,
             writer=writer,
+            memory_store=memory_store,
+            memory_runtime=memory_runtime,
+            memory_projector=memory_projector,
+            memory_redactor=memory_redactor,
             agents_md=agents_md,
             skill_catalog=(skill_catalog or SkillCatalog()).resolved(),
             known_message_ids=known_message_ids,
@@ -162,6 +183,7 @@ class AgentSession:
         tools: list[Tool] | None = None,
         permission_manager: PermissionManager | None = None,
         sandbox_access: SandboxAccess | None = None,
+        workspace_root: str | Path | None = None,
     ) -> "AgentSession":
         """从项目根目录创建 session。
 
@@ -183,6 +205,7 @@ class AgentSession:
             tools=tools,
             permission_manager=permission_manager,
             sandbox_access=sandbox_access,
+            workspace_root=workspace_root or project_root,
         )
 
     @classmethod
@@ -196,6 +219,7 @@ class AgentSession:
         tools: list[Tool] | None = None,
         permission_manager: PermissionManager | None = None,
         sandbox_access: SandboxAccess | None = None,
+        workspace_root: str | Path | None = None,
     ) -> "AgentSession":
         """从 JSONL 会话日志恢复运行期 session。
 
@@ -209,6 +233,12 @@ class AgentSession:
         known_message_ids = {message.id for message in view.messages}
         turn_counter = _infer_turn_counter(view.messages)
         writer = SessionEventWriter(store=store, session_id=session_id, current_turn=turn_counter)
+        memory_store, memory_runtime, memory_projector, memory_redactor = _build_memory_components(
+            store=store,
+            session_id=session_id,
+            workspace_root=workspace_root,
+            writer=writer,
+        )
         registry = create_session_tool_registry(
             session_id=session_id,
             runtime_state=runtime_state,
@@ -221,6 +251,7 @@ class AgentSession:
             store=store,
             writer=writer,
             skill_catalog=(skill_catalog or SkillCatalog()).resolved(),
+            memory_runtime=memory_runtime,
         )
         session = cls(
             session_id=session_id,
@@ -228,6 +259,10 @@ class AgentSession:
             runtime_state=runtime_state,
             tool_registry=registry,
             writer=writer,
+            memory_store=memory_store,
+            memory_runtime=memory_runtime,
+            memory_projector=memory_projector,
+            memory_redactor=memory_redactor,
             agents_md=agents_md,
             skill_catalog=(skill_catalog or SkillCatalog()).resolved(),
             known_message_ids=known_message_ids,
@@ -672,3 +707,67 @@ def _task_boundary_required_stable_count(permission_manager: PermissionManager |
     if permission_manager is not None and permission_manager.mode == PermissionMode.BYPASS:
         return 1
     return 2
+
+
+def _build_memory_components(
+    *,
+    store: JsonlSessionStore,
+    session_id: str,
+    workspace_root: str | Path | None,
+    writer: SessionEventWriter,
+) -> tuple[DurableMemoryStore, MemoryRuntime, MemoryProjector, MemoryRedactor]:
+    """创建同一 session 共享的 memory store、runtime 和 projector。
+
+    正常 app 的 JSONL root 是 ``<workspace>/.firstcoder``，单元测试则常直接把
+    临时目录作为 store root；这个推导兼容两种形状，同时允许 SessionBootstrap
+    显式传入 worktree/project root，避免 subagent 把记忆绑定到错误目录。
+    """
+
+    resolved_store_root = Path(store.root).resolve()
+    if workspace_root is None:
+        resolved_workspace = (
+            resolved_store_root.parent
+            if resolved_store_root.name == ".firstcoder"
+            else resolved_store_root
+        )
+    else:
+        resolved_workspace = Path(workspace_root).resolve()
+    memory_redactor = MemoryRedactor()
+    memory_store = DurableMemoryStore(
+        default_memory_root(resolved_workspace),
+        workspace_root=resolved_workspace,
+    )
+
+    def append_memory_audit(event_type: str, payload: dict[str, object]) -> None:
+        if event_type == "memory_recorded":
+            writer.append_memory_recorded(payload=payload)
+        elif event_type == "memory_retrieved":
+            writer.append_memory_retrieved(payload=payload)
+
+    def append_retrieval_audit(result) -> None:
+        writer.append_memory_retrieved(
+            payload={
+                "query": memory_redactor.redact_text(result.query.text),
+                "query_hash": result.query_hash,
+                "selected_note_ids": [
+                    selection.note.note_id
+                    for selection in result.selections
+                    if selection.selected
+                ],
+                "selected_count": len(result.selected_notes),
+            }
+        )
+
+    memory_runtime = MemoryRuntime(
+        store=memory_store,
+        session_id=session_id,
+        security=memory_redactor,
+        audit=append_memory_audit,
+    )
+    memory_projector = MemoryProjector(
+        memory_store,
+        workspace_root=resolved_workspace,
+        security=memory_redactor,
+        audit=append_retrieval_audit,
+    )
+    return memory_store, memory_runtime, memory_projector, memory_redactor
