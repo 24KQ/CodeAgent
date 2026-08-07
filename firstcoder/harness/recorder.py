@@ -179,6 +179,7 @@ class RunRecorder:
         self.start()
         budget: ContextBudget = prepared.context_budget
         prompt_hash = str(prepared.projection_fingerprint)
+        request_id = str(getattr(prepared, "request_id", "") or "")
         identity = _provider_identity(provider, budget.context_window, prompt_hash)
         pressure = self.pressure_controller.evaluate(
             estimated_input_tokens=budget.input_tokens,
@@ -203,6 +204,8 @@ class RunRecorder:
             "provider": identity["provider"],
             "provider_base_url": identity["provider_base_url"],
             "model": identity["model"],
+            "request_id": request_id,
+            "projection_fingerprint": prompt_hash,
             "prompt_hash": prompt_hash,
             "context_usage": context_usage,
         }
@@ -212,6 +215,8 @@ class RunRecorder:
             "prompt_built",
             {
                 "prompt_metadata": metadata,
+                "request_id": request_id,
+                "projection_fingerprint": prompt_hash,
                 "estimated_input_tokens": budget.input_tokens,
                 "input_chars": sum(len(message.content or "") for message in prepared.request.messages),
             },
@@ -229,6 +234,7 @@ class RunRecorder:
             turn_id=self.task_state.task_id,
             provider=str(provider.name),
             model=str(provider.model),
+            projection_fingerprint=str(prepared.projection_fingerprint),
             protocol=protocol,
             base_url=str(getattr(provider, "base_url", "") or ""),
             request_at=now_iso(),
@@ -241,6 +247,8 @@ class RunRecorder:
             "model_requested",
             {
                 "provider_call": metadata.to_dict(),
+                "request_id": metadata.call_id,
+                "projection_fingerprint": metadata.projection_fingerprint,
                 "provider_protocol": protocol,
                 "provider_model": metadata.model,
             },
@@ -270,6 +278,8 @@ class RunRecorder:
             {
                 "provider_call": metadata.to_dict(),
                 "provider_call_metadata": metadata.to_dict(),
+                "request_id": metadata.call_id,
+                "projection_fingerprint": metadata.projection_fingerprint,
                 "completion_metadata": completion,
                 "finish_reason": metadata.finish_reason,
                 "output_chars": len(str(response.content or "")),
@@ -601,6 +611,8 @@ def _completion_metadata(metadata: ProviderCallMetadata, provider: Any) -> dict[
     usage = metadata.usage.to_dict()
     return {
         "call_id": metadata.call_id,
+        "request_id": metadata.call_id,
+        "projection_fingerprint": metadata.projection_fingerprint,
         "provider": metadata.provider,
         "provider_model": metadata.model,
         "provider_protocol": metadata.protocol,

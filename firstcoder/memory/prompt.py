@@ -116,12 +116,20 @@ def extract_memory_tags(text: object) -> list[str]:
 
 @dataclass(frozen=True, slots=True)
 class MemoryProjection:
-    """一次动态 memory 投影的结果和可审计计数。"""
+    """一次动态 memory 投影的正文和可审计元数据。
+
+    ``text`` 是给 provider 看的动态 system message；其余字段来自同一次
+    ``RetrievalResult``，用于在 AgentLoop 创建 ``PreparedMainRequest`` 后补写
+    request-level audit。这里不保存 note 正文，避免审计层重复持有敏感内容。
+    """
 
     text: str
     note_count: int = 0
     char_count: int = 0
     query_hash: str = ""
+    selected_note_ids: tuple[str, ...] = ()
+    rejected_reasons: tuple[tuple[str, str], ...] = ()
+    include_global: bool = False
 
 
 class MemoryProjector:
@@ -221,12 +229,22 @@ class MemoryProjector:
             )
             selected = result.selected_notes[: self.max_notes]
 
+        selected_note_ids = tuple(note.note_id for note in selected if note.note_id)
+        rejected_reasons = tuple(
+            (selection.note.note_id, str(selection.reject_reason))
+            for selection in (result.selections if result is not None else [])
+            if not selection.selected and selection.reject_reason and selection.note.note_id
+        )
+
         if not selected:
             # 没有 query 或没有通过 scope 过滤的命中时，不给请求增加一条
             # 只包含通用说明的 system message，也不泄漏未过滤 index。
             return MemoryProjection(
                 text="",
                 query_hash=result.query_hash if result is not None else "",
+                selected_note_ids=selected_note_ids,
+                rejected_reasons=rejected_reasons,
+                include_global=include_global,
             )
 
         section = build_memory_system_section(
@@ -248,7 +266,34 @@ class MemoryProjector:
             note_count=len(selected),
             char_count=len(section),
             query_hash=result.query_hash if result is not None else "",
+            selected_note_ids=selected_note_ids,
+            rejected_reasons=rejected_reasons,
+            include_global=include_global,
         )
+
+    def build_message_with_metadata(
+        self,
+        query: object = "",
+        *,
+        record_audit: bool = False,
+        include_global: bool = False,
+    ) -> tuple[ChatMessage | None, MemoryProjection]:
+        """构造消息及其同源 metadata，供 AgentLoop 的内部接线使用。
+
+        预算试算和真实请求都必须从同一个 projection builder 得到消息，才能保证
+        预算中的字符与最终请求一致；但只有真实请求会把返回的 metadata 暂存并在
+        ``PreparedMainRequest`` 创建后提交 audit。保留这个单独入口也让旧的
+        ``build_message()`` 继续只返回 ``ChatMessage``，不破坏已有调用方。
+        """
+
+        projection = self.project_with_metadata(
+            query,
+            record_audit=record_audit,
+            include_global=include_global,
+        )
+        if not projection.text:
+            return None, projection
+        return ChatMessage(role="system", content=projection.text), projection
 
     def build_message(
         self,
@@ -259,14 +304,12 @@ class MemoryProjector:
     ) -> ChatMessage | None:
         """把动态投影包装成一个独立 system message；空投影返回 None。"""
 
-        projection = self.project_with_metadata(
+        message, _ = self.build_message_with_metadata(
             query,
             record_audit=record_audit,
             include_global=include_global,
         )
-        if not projection.text:
-            return None
-        return ChatMessage(role="system", content=projection.text)
+        return message
 
     def render_retrieval(
         self,

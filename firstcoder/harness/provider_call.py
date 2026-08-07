@@ -61,6 +61,9 @@ class ProviderCallMetadata:
     prompt_estimation_source: str = ""
     error: str = ""
     retry_of: str = ""
+    # 放在旧字段末尾，保留历史位置参数构造的含义；memory benchmark 用它把
+    # provider call 与同一次完整 prompt 投影确定性关联起来。
+    projection_fingerprint: str = ""
 
     def to_dict(self) -> dict:
         payload = asdict(self)

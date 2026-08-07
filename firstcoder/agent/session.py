@@ -39,7 +39,7 @@ from firstcoder.context.models import AgentMessage, MessagePart, SessionView
 from firstcoder.input.attachments import UserAttachment, prepare_attachments_for_session
 from firstcoder.memory.durable import DurableMemoryStore
 from firstcoder.memory.paths import default_global_memory_root, default_memory_root
-from firstcoder.memory.prompt import MemoryProjector
+from firstcoder.memory.prompt import MemoryProjection, MemoryProjector
 from firstcoder.memory.redact import MemoryRedactor
 from firstcoder.memory.runtime import MemoryRuntime
 from firstcoder.utils.sandbox_access import SandboxAccess, SandboxAccessMode
@@ -121,6 +121,7 @@ class AgentSession:
         permission_manager: PermissionManager | None = None,
         sandbox_access: SandboxAccess | None = None,
         workspace_root: str | Path | None = None,
+        global_memory_store: DurableMemoryStore | None = None,
     ) -> "AgentSession":
         """创建全新 session，并初始化 session-scoped 工具。
 
@@ -136,6 +137,7 @@ class AgentSession:
             session_id=session_id,
             workspace_root=workspace_root,
             writer=writer,
+            global_memory_store=global_memory_store,
         )
         registry = create_session_tool_registry(
             session_id=session_id,
@@ -184,6 +186,7 @@ class AgentSession:
         permission_manager: PermissionManager | None = None,
         sandbox_access: SandboxAccess | None = None,
         workspace_root: str | Path | None = None,
+        global_memory_store: DurableMemoryStore | None = None,
     ) -> "AgentSession":
         """从项目根目录创建 session。
 
@@ -206,6 +209,7 @@ class AgentSession:
             permission_manager=permission_manager,
             sandbox_access=sandbox_access,
             workspace_root=workspace_root or project_root,
+            global_memory_store=global_memory_store,
         )
 
     @classmethod
@@ -220,6 +224,7 @@ class AgentSession:
         permission_manager: PermissionManager | None = None,
         sandbox_access: SandboxAccess | None = None,
         workspace_root: str | Path | None = None,
+        global_memory_store: DurableMemoryStore | None = None,
     ) -> "AgentSession":
         """从 JSONL 会话日志恢复运行期 session。
 
@@ -238,6 +243,7 @@ class AgentSession:
             session_id=session_id,
             workspace_root=workspace_root,
             writer=writer,
+            global_memory_store=global_memory_store,
         )
         registry = create_session_tool_registry(
             session_id=session_id,
@@ -462,6 +468,34 @@ class AgentSession:
             model=model,
         )
         self.runtime_state.consumed_tool_result_part_ids.update(new_ids)
+
+    def append_memory_retrieval_audit(
+        self,
+        *,
+        request_id: str,
+        projection_fingerprint: str,
+        projection: MemoryProjection,
+    ) -> None:
+        """在真实 provider request 已经准备好后写入 memory retrieval audit。
+
+        memory 检索是旁路事实，不能写成普通消息；同时 request/fingerprint 必须由
+        AgentLoop 在构造完整 ``PreparedMainRequest`` 后补齐，避免预算试算产生一条
+        看似真实、却没有对应 provider 请求的高可信审计记录。
+        """
+
+        self.writer.append_memory_retrieved(
+            payload={
+                "request_id": str(request_id),
+                "projection_fingerprint": str(projection_fingerprint),
+                "query_hash": str(projection.query_hash),
+                "selected_note_ids": list(projection.selected_note_ids),
+                "rejected_reasons": {
+                    note_id: reason for note_id, reason in projection.rejected_reasons
+                },
+                "include_global": bool(projection.include_global),
+                "selected_count": len(projection.selected_note_ids),
+            }
+        )
 
     def execute_tool_call(self, tool_call: ToolCall) -> ToolResult:
         """通过当前 session 的工具注册表执行一次模型请求的工具调用。"""
@@ -715,6 +749,7 @@ def _build_memory_components(
     session_id: str,
     workspace_root: str | Path | None,
     writer: SessionEventWriter,
+    global_memory_store: DurableMemoryStore | None = None,
 ) -> tuple[DurableMemoryStore, MemoryRuntime, MemoryProjector, MemoryRedactor]:
     """创建同一 session 共享的 memory store、runtime 和 projector。
 
@@ -737,9 +772,9 @@ def _build_memory_components(
         default_memory_root(resolved_workspace),
         workspace_root=resolved_workspace,
     )
-    # Global memory 使用独立的用户级目录；仅把 store 注入当前 session，默认
-    # 查询仍关闭 include_global，避免“能访问”被误解为“自动注入”。
-    global_memory_store = DurableMemoryStore(
+    # 正常应用默认使用独立的用户级目录；benchmark、隔离 runner 和测试可以显式
+    # 注入临时 store，从源头阻止验证过程触碰用户历史 global memory。
+    resolved_global_store = global_memory_store or DurableMemoryStore(
         default_global_memory_root(),
         global_store=True,
     )
@@ -770,13 +805,13 @@ def _build_memory_components(
         session_id=session_id,
         security=memory_redactor,
         audit=append_memory_audit,
-        global_store=global_memory_store,
+        global_store=resolved_global_store,
     )
     memory_projector = MemoryProjector(
         memory_store,
         workspace_root=resolved_workspace,
         session_id=session_id,
-        global_store=global_memory_store,
+        global_store=resolved_global_store,
         security=memory_redactor,
         audit=append_retrieval_audit,
     )
