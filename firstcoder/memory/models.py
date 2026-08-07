@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 NoteStatus = Literal["active", "superseded", "quarantined"]
+MemoryVisibility = Literal["session", "workspace", "global"]
+MEMORY_VISIBILITIES = frozenset({"session", "workspace", "global"})
 RejectReason = Literal[
     "duplicate",
     "secret_shaped",
@@ -24,6 +26,8 @@ RejectReason = Literal[
     "superseded",
     "stale_evidence",
     "scope_mismatch",
+    "session_mismatch",
+    "global_disabled",
     "below_limit",
 ]
 
@@ -40,7 +44,11 @@ class MemoryEvidence:
     source_path: str = ""
     session_id: str = ""
     anchor_hash: str = ""
+    # `scope` 保留 P2 的 workspace fingerprint 契约；visibility 才表示
+    # 这条记忆允许在哪个上下文中被读取。显式 capture 在 runtime 层使用
+    # session，durable promote 默认使用 workspace，避免两个概念混用。
     scope: str = "workspace"
+    visibility: MemoryVisibility = "workspace"
 
 
 @dataclass(frozen=True)
@@ -66,6 +74,10 @@ class MemoryQuery:
     text: str
     limit: int = 5
     include_quarantined: bool = False
+    # 检索上下文由宿主 session 注入；缺少 session_id 时不会命中 session-only
+    # 记忆。global 记忆必须由调用方显式开启，默认拒绝。
+    session_id: str = ""
+    include_global: bool = False
 
 
 @dataclass(frozen=True)

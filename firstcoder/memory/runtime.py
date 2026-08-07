@@ -13,9 +13,11 @@ from typing import Any
 
 from firstcoder.memory.durable import DurableMemoryStore, note_id_for
 from firstcoder.memory.models import (
+    MEMORY_VISIBILITIES,
     MemoryEvidence,
     MemoryNote,
     MemoryQuery,
+    MemoryVisibility,
     RetrievalResult,
 )
 from firstcoder.memory.redact import MemoryRedactor
@@ -44,6 +46,7 @@ class MemoryWriteReceipt:
     note_id: str = ""
     error: str = ""
     superseded_count: int = 0
+    visibility: MemoryVisibility = "session"
 
     def public_data(self) -> dict[str, object]:
         """返回可直接给工具/UI 的非敏感字段。"""
@@ -56,6 +59,7 @@ class MemoryWriteReceipt:
             "promoted": self.promoted,
             "note_id": self.note_id,
             "superseded_count": self.superseded_count,
+            "visibility": self.visibility,
         }
 
 
@@ -68,6 +72,9 @@ class MemoryRuntime:
     security: MemoryRedactor = field(default_factory=MemoryRedactor)
     audit: MemoryAuditCallback | None = None
     max_entry_chars: int = MAX_MEMORY_ENTRY_CHARS
+    # Global store 独立于当前 workspace；存在这个引用不等于允许读取，
+    # retrieve/projector 仍必须收到 include_global=True 才会加入查询快照。
+    global_store: DurableMemoryStore | None = None
 
     def record(self, text: object, *, source: str) -> MemoryWriteReceipt:
         """脱敏后追加 daily log，并追加不含原文的 ``memory_recorded`` audit。
@@ -106,6 +113,7 @@ class MemoryRuntime:
             chars=len(sanitized),
             redacted=redacted,
             quarantined=quarantined,
+            visibility="session",
         )
         self._emit(
             "memory_recorded",
@@ -119,13 +127,40 @@ class MemoryRuntime:
         )
         return receipt
 
-    def promote(self, topic: object, text: object, *, source: str) -> MemoryWriteReceipt:
+    def promote(
+        self,
+        topic: object,
+        text: object,
+        *,
+        source: str,
+        visibility: MemoryVisibility = "workspace",
+    ) -> MemoryWriteReceipt:
         """安全地提升一条 durable note。
 
         gate 在脱敏前检查原文，确保 secret 或 prompt injection 不会因为先被
         替换成 ``<redacted>`` 而意外变成 active memory。被隔离的输入只留下
         audit，不写入 durable topic，也就不可能被下一轮 request 注入。
         """
+
+        requested_visibility = self._normalize_visibility(visibility)
+        if requested_visibility is None:
+            return MemoryWriteReceipt(
+                ok=False,
+                operation="promote",
+                error="记忆作用域必须是 session、workspace 或 global",
+                visibility="workspace",
+            )
+
+        target_store = self.store
+        if requested_visibility == "global":
+            if self.global_store is None:
+                return MemoryWriteReceipt(
+                    ok=False,
+                    operation="promote",
+                    error="全局记忆存储未启用",
+                    visibility="global",
+                )
+            target_store = self.global_store
 
         topic_text = str(topic or "").strip()
         original = self._normalize_text(text)
@@ -148,6 +183,7 @@ class MemoryRuntime:
                 redacted=redacted,
                 quarantined=True,
                 error="记忆内容已隔离，未提升为 durable memory",
+                visibility=requested_visibility,
             )
             self._emit(
                 "memory_recorded",
@@ -170,11 +206,13 @@ class MemoryRuntime:
         note = MemoryNote(
             topic=topic_text,
             text=sanitized,
-            evidence=self._evidence_for_text(sanitized),
+            evidence=self._evidence_for_text(sanitized, visibility=requested_visibility),
         )
         try:
-            self.store.upsert_topic(note)
-            snapshot = self.store.snapshot(self.store.workspace_root)
+            target_store.upsert_topic(note)
+            snapshot = target_store.snapshot(
+                None if target_store.global_store else target_store.workspace_root
+            )
         except (OSError, ValueError, KeyError):
             return MemoryWriteReceipt(
                 ok=False,
@@ -182,6 +220,7 @@ class MemoryRuntime:
                 chars=len(sanitized),
                 redacted=redacted,
                 error="durable memory 提升失败",
+                visibility=requested_visibility,
             )
 
         resolved_id = note_id_for(topic_text, sanitized)
@@ -199,6 +238,7 @@ class MemoryRuntime:
             promoted=str(stored.get("status", "active")) == "active",
             note_id=resolved_id,
             superseded_count=superseded_count,
+            visibility=requested_visibility,
         )
         self._emit(
             "memory_recorded",
@@ -212,18 +252,34 @@ class MemoryRuntime:
                 "promoted": receipt.promoted,
                 "note_id": receipt.note_id,
                 "superseded_count": receipt.superseded_count,
+                "visibility": receipt.visibility,
             },
         )
         return receipt
 
-    def retrieve(self, query: object, *, limit: int = 5) -> RetrievalResult:
+    def retrieve(
+        self,
+        query: object,
+        *,
+        limit: int = 5,
+        include_global: bool = False,
+    ) -> RetrievalResult:
         """用脱敏 query 做一次快照检索，并写入 audit-only retrieval 事件。"""
 
         sanitized_query = self._bounded(self.security.redact_text(str(query or "")).strip())
         result = MemoryRetriever(
             store=self.store,
+            global_store=self.global_store,
             workspace_root=self.store.workspace_root,
-        ).retrieve(MemoryQuery(text=sanitized_query, limit=max(0, int(limit))))
+            session_id=self.session_id,
+        ).retrieve(
+            MemoryQuery(
+                text=sanitized_query,
+                limit=max(0, int(limit)),
+                session_id=self.session_id,
+                include_global=include_global,
+            )
+        )
         self._emit(
             "memory_retrieved",
             {
@@ -231,6 +287,7 @@ class MemoryRuntime:
                 "query_hash": result.query_hash,
                 "selected_note_ids": [selection.note.note_id for selection in result.selections if selection.selected],
                 "selected_count": len(result.selected_notes),
+                "include_global": include_global,
             },
         )
         return result
@@ -238,9 +295,9 @@ class MemoryRuntime:
     def _evidence(self) -> MemoryEvidence:
         # scope 使用契约默认占位值，DurableMemoryStore 会在 workspace 绑定时
         # 保留其真实 fingerprint；不能在这里用字面量覆盖真实 workspace scope。
-        return MemoryEvidence(session_id=self.session_id, scope="workspace")
+        return MemoryEvidence(session_id=self.session_id, scope="workspace", visibility="session")
 
-    def _evidence_for_text(self, text: str) -> MemoryEvidence:
+    def _evidence_for_text(self, text: str, *, visibility: MemoryVisibility) -> MemoryEvidence:
         """从当天 sidecar 恢复本 session 的捕获证据，找不到时使用默认值。"""
 
         try:
@@ -248,7 +305,11 @@ class MemoryRuntime:
         except (OSError, ValueError):
             # sidecar 是 provenance 增强信息；损坏或暂时不可读时不应阻断
             # 已经明确要求的 durable promotion，调用方仍保留 session scope。
-            return self._evidence()
+            return MemoryEvidence(
+                session_id=self.session_id,
+                scope="workspace",
+                visibility=visibility,
+            )
         for row in reversed(rows):
             if not isinstance(row, dict):
                 continue
@@ -261,8 +322,22 @@ class MemoryRuntime:
                 session_id=self.session_id,
                 anchor_hash=str(row.get("evidence_anchor_hash") or ""),
                 scope=str(row.get("scope") or "workspace"),
+                visibility=visibility,
             )
-        return self._evidence()
+        return MemoryEvidence(
+            session_id=self.session_id,
+            scope="workspace",
+            visibility=visibility,
+        )
+
+    @staticmethod
+    def _normalize_visibility(value: object) -> MemoryVisibility | None:
+        """把外部命令/工具参数收敛到三个公开作用域枚举。"""
+
+        normalized = str(value or "").strip().lower()
+        if normalized not in MEMORY_VISIBILITIES:
+            return None
+        return normalized  # type: ignore[return-value]
 
     def _bounded(self, value: str) -> str:
         if len(value) <= self.max_entry_chars:

@@ -22,8 +22,8 @@ def test_help_command_lists_current_slash_commands() -> None:
         "/context": "Inspect context state.",
         "/compact status": "Show compaction status.",
         "/compact": "Compact context now.",
-        "/remember <text> [--promote <topic>]": "Save a note to project memory.",
-        "/memory [query]": "Show or search project memory.",
+        "/remember <text> [--promote <topic>] [--global]": "Capture or promote memory.",
+        "/memory [--global] [query]": "Show or search visible memory.",
         "/mode": "Show permission mode.",
         "/mode <standard|aggressive|bypass>": "Change permission mode.",
     }

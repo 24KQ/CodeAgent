@@ -188,10 +188,78 @@ def test_scope_fingerprint_isolation(tmp_path: Path) -> None:
     assert other.selections[0].reject_reason == "scope_mismatch"
 
 
-def test_global_scope_always_selected(tmp_path: Path) -> None:
-    state = {"episodic_notes": [_state_note("pytest note", scope="global")]}
-    result = _retriever(state).retrieve(MemoryQuery(text="pytest"))
-    assert [s.text for s in result.selected_notes] == ["pytest note"]
+def test_global_visibility_requires_explicit_opt_in() -> None:
+    state = {"episodic_notes": [_state_note("pytest global note", scope="global")]}
+
+    default = _retriever(state).retrieve(MemoryQuery(text="pytest"))
+    assert default.selected_notes == []
+    assert default.selections[0].reject_reason == "global_disabled"
+
+    opted_in = _retriever(state).retrieve(MemoryQuery(text="pytest", include_global=True))
+    assert [s.text for s in opted_in.selected_notes] == ["pytest global note"]
+
+
+def test_session_visibility_requires_matching_session() -> None:
+    state = {
+        "episodic_notes": [
+            _state_note(
+                "pytest session note",
+                visibility="session",
+                evidence={"session_id": "session-a"},
+            )
+        ]
+    }
+
+    same_session = _retriever(state, session_id="session-a").retrieve(
+        MemoryQuery(text="pytest", session_id="session-a")
+    )
+    assert [note.text for note in same_session.selected_notes] == ["pytest session note"]
+
+    other_session = _retriever(state, session_id="session-b").retrieve(
+        MemoryQuery(text="pytest", session_id="session-b")
+    )
+    assert other_session.selected_notes == []
+    assert other_session.selections[0].reject_reason == "session_mismatch"
+
+
+def test_workspace_visibility_is_shared_by_sessions() -> None:
+    state = {
+        "episodic_notes": [
+            _state_note(
+                "pytest workspace note",
+                visibility="workspace",
+                scope="workspace_fingerprint",
+            )
+        ]
+    }
+
+    result = _retriever(state, session_id="session-b").retrieve(
+        MemoryQuery(text="pytest", session_id="session-b")
+    )
+    assert [note.text for note in result.selected_notes] == ["pytest workspace note"]
+
+
+def test_session_visibility_also_respects_workspace_fingerprint(tmp_path: Path) -> None:
+    """session id 不是 workspace 边界，避免相同 id 在别的项目重用时泄漏。"""
+
+    ws_a = tmp_path / "ws_a"
+    ws_b = tmp_path / "ws_b"
+    ws_a.mkdir()
+    ws_b.mkdir()
+    store = DurableMemoryStore(ws_a / ".firstcoder" / "memory", workspace_root=ws_a)
+    store.upsert_topic(
+        MemoryNote(
+            topic="key-decisions",
+            text="pytest private session fact",
+            evidence=MemoryEvidence(session_id="reused-session", visibility="session"),
+        )
+    )
+
+    result = MemoryRetriever(store=store, workspace_root=ws_b, session_id="reused-session").retrieve(
+        MemoryQuery(text="pytest", session_id="reused-session")
+    )
+    assert result.selected_notes == []
+    assert result.selections[0].reject_reason == "scope_mismatch"
 
 
 def test_score_monotone_with_ranking() -> None:

@@ -8,7 +8,7 @@ from typing import Protocol
 
 from firstcoder.app.commands import CommandResult
 from firstcoder.memory.durable import DURABLE_TOPIC_DEFAULTS
-from firstcoder.memory.prompt import MemoryProjector, load_memory_index_text
+from firstcoder.memory.prompt import MemoryProjector
 from firstcoder.memory.runtime import MemoryRuntime
 
 _PROMOTABLE_TOPICS = frozenset(DURABLE_TOPIC_DEFAULTS)
@@ -36,34 +36,47 @@ class MemoryCommandHandler:
         if command == "/memory":
             return CommandResult(handled=True, output=self._show_index())
         if command.startswith("/memory "):
-            query = command.split(" ", 1)[1].strip()
+            include_global, query = _split_global_flag(command.split(" ", 1)[1].strip())
             if not query:
-                return CommandResult(handled=True, output=self._show_index())
+                return CommandResult(
+                    handled=True,
+                    output=self._show_index(include_global=include_global),
+                )
             return CommandResult(
                 handled=True,
-                output=self.session.memory_projector.render_retrieval(query),
+                output=self.session.memory_projector.render_retrieval(
+                    query,
+                    include_global=include_global,
+                ),
             )
         if command == "/remember":
-            return CommandResult(handled=True, output="Usage: /remember <text> [--promote <topic>]")
+            return CommandResult(
+                handled=True,
+                output="Usage: /remember <text> [--promote <topic>] [--global]",
+            )
         if command.startswith("/remember "):
             return CommandResult(handled=True, output=self._remember(command[10:].strip()))
         return CommandResult(handled=False)
 
-    def _show_index(self) -> str:
-        index = load_memory_index_text(
-            self.session.memory_runtime.store.root,
-            security=self.session.memory_runtime.security,
-        )
+    def _show_index(self, *, include_global: bool = False) -> str:
+        # index 展示也必须走 projector 的 visibility 过滤，不能直接读取
+        # MEMORY.md；否则 session-only/global 条目会绕过读取边界。
+        index = self.session.memory_projector.render_index(include_global=include_global)
         if not index:
             return "No durable memories yet. Use /remember <text> to capture one."
         return index
 
     def _remember(self, raw: str) -> str:
-        text, topic = _split_promote_syntax(raw)
+        include_global, scoped_raw = _split_global_flag(raw)
+        text, topic = _split_promote_syntax(scoped_raw)
         if topic == _INVALID_PROMOTE:
-            return "Usage: /remember <text> [--promote <topic>]"
+            return "Usage: /remember <text> [--promote <topic>] [--global]"
         if not text:
-            return "Usage: /remember <text> [--promote <topic>]"
+            return "Usage: /remember <text> [--promote <topic>] [--global]"
+        if include_global and topic is None:
+            # global 只能通过明确 promotion 进入独立 store，普通 capture
+            # 仍固定属于当前 session，避免一个 flag 意外改变 capture 语义。
+            return "Usage: /remember <text> [--promote <topic>] [--global]"
 
         try:
             captured = self.session.memory_runtime.record(text, source="slash_command")
@@ -77,12 +90,37 @@ class MemoryCommandHandler:
             return "Saved to the daily log."
 
         try:
-            promoted = self.session.memory_runtime.promote(topic, text, source="slash_command")
+            promoted = self.session.memory_runtime.promote(
+                topic,
+                text,
+                source="slash_command",
+                visibility="global" if include_global else "workspace",
+            )
         except Exception:  # noqa: BLE001 - 不把原始输入交给 UI 错误文本
             return "Saved to the daily log; durable promotion was blocked."
         if not promoted.ok:
             return "Saved to the daily log; durable promotion was blocked."
+        if include_global:
+            return "Saved to the daily log and promoted to global memory."
         return "Saved to the daily log and promoted to durable memory."
+
+
+def _split_global_flag(raw: str) -> tuple[bool, str]:
+    """解析命令首尾的 ``--global``，保留正文中的同名自然语言 token。
+
+    flag 只允许出现在命令开头或结尾；如果无条件删除正文中所有同名词，
+    ``/remember note about --global behavior`` 会在写入前悄悄改变原文。
+    """
+
+    value = str(raw or "").strip()
+    if not value:
+        return False, ""
+    parts = value.split()
+    if parts and parts[0] == "--global":
+        return True, " ".join(parts[1:]).strip()
+    if parts and parts[-1] == "--global":
+        return True, " ".join(parts[:-1]).strip()
+    return False, value
 
 
 def _split_promote_syntax(raw: str) -> tuple[str, str | None]:

@@ -15,11 +15,27 @@ from firstcoder.utils.schema import object_schema
 def create_memory_note_tool(runtime: MemoryRuntime) -> Tool:
     """创建写 daily log 的 session-scoped memory 工具。"""
 
-    def memory_note(*, text: str, promote: bool = False, topic: str = "key-decisions") -> ToolResult:
+    def memory_note(
+        *,
+        text: str,
+        promote: bool = False,
+        topic: str = "key-decisions",
+        visibility: str = "session",
+    ) -> ToolResult:
         if not isinstance(text, str) or not text.strip():
             return make_error_result("memory_note", "text 不能为空")
         if not isinstance(promote, bool):
             return make_error_result("memory_note", "promote 必须是布尔值")
+        if visibility not in {"session", "workspace", "global"}:
+            return make_error_result(
+                "memory_note",
+                "visibility 必须是 session、workspace 或 global",
+            )
+        if not promote and visibility != "session":
+            return make_error_result(
+                "memory_note",
+                "未 promote 的 memory note 只能属于 session",
+            )
 
         try:
             captured = runtime.record(text, source="tool:memory_note")
@@ -33,7 +49,12 @@ def create_memory_note_tool(runtime: MemoryRuntime) -> Tool:
             return make_text_result("memory_note", "Memory note saved to the daily log.", **data)
 
         try:
-            promoted = runtime.promote(topic, text, source="tool:memory_note")
+            promoted = runtime.promote(
+                topic,
+                text,
+                source="tool:memory_note",
+                visibility="workspace" if visibility == "session" else visibility,
+            )
         except Exception:  # noqa: BLE001 - 不让通用 registry 把原始参数放进 error data
             return make_text_result(
                 "memory_note",
@@ -63,6 +84,11 @@ def create_memory_note_tool(runtime: MemoryRuntime) -> Tool:
                 "type": "string",
                 "enum": ["project-conventions", "key-decisions", "dependency-facts", "user-preferences"],
                 "default": "key-decisions",
+            },
+            "visibility": {
+                "type": "string",
+                "enum": ["session", "workspace", "global"],
+                "default": "session",
             },
         },
         required=["text"],

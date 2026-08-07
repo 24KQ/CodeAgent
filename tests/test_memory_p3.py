@@ -11,11 +11,12 @@ from pathlib import Path
 
 from firstcoder.agent.loop import AgentLoop
 from firstcoder.agent.session import AgentSession
-from firstcoder.app.memory_commands import MemoryCommandHandler, _split_promote_syntax
+from firstcoder.app.memory_commands import MemoryCommandHandler, _split_global_flag, _split_promote_syntax
 from firstcoder.app.runtime import CurrentSessionState
 from firstcoder.context.store import JsonlSessionStore
 from firstcoder.memory.durable import DurableMemoryStore
 from firstcoder.memory.logs import daily_log_path, ensure_memory_dir
+from firstcoder.memory.models import MemoryEvidence, MemoryNote
 from firstcoder.memory.prompt import (
     MAX_MEMORY_INDEX_CHARS,
     MemoryProjector,
@@ -35,6 +36,102 @@ def _memory_runtime(tmp_path: Path, *, session_id: str = "sess_memory") -> Memor
         workspace_root=workspace,
     )
     return MemoryRuntime(store=store, session_id=session_id)
+
+
+def test_memory_runtime_capture_is_session_scoped_but_promotion_is_workspace_scoped(
+    tmp_path: Path,
+) -> None:
+    """捕获先留在 session；明确 promote 后才允许同 workspace 跨 session 读取。"""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = DurableMemoryStore(workspace / ".firstcoder" / "memory", workspace_root=workspace)
+    global_store = DurableMemoryStore(tmp_path / "global-memory", global_store=True)
+    runtime = MemoryRuntime(
+        store=store,
+        global_store=global_store,
+        session_id="session-a",
+    )
+
+    captured = runtime.record("pytest is the project test runner", source="test")
+    assert captured.ok is True
+    sidecar = store.load_daily_log_evidence()
+    assert sidecar[-1]["visibility"] == "session"
+
+    promoted = runtime.promote(
+        "key-decisions",
+        "pytest is the project test runner",
+        source="test",
+    )
+    assert promoted.ok is True
+    row = store._load_topic_metadata("key-decisions")[promoted.note_id]
+    assert row["visibility"] == "workspace"
+
+    global_promoted = runtime.promote(
+        "dependency-facts",
+        "pytest is globally approved",
+        source="test",
+        visibility="global",
+    )
+    assert global_promoted.ok is True
+    assert global_store._load_topic_metadata("dependency-facts")[global_promoted.note_id]["visibility"] == "global"
+    assert all(note["note_id"] != global_promoted.note_id for note in store.snapshot(workspace))
+
+
+def test_memory_retrieval_reads_session_workspace_and_opted_in_global(tmp_path: Path) -> None:
+    """projector 的上下文参数决定注入内容，不能靠同一个磁盘目录猜 session。"""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = DurableMemoryStore(workspace / ".firstcoder" / "memory", workspace_root=workspace)
+    global_store = DurableMemoryStore(tmp_path / "global-memory", global_store=True)
+    store.upsert_topic(
+        MemoryNote(
+            topic="key-decisions",
+            text="pytest session-only fact",
+            evidence=MemoryEvidence(session_id="session-a", visibility="session"),
+        )
+    )
+    store.promote([("key-decisions", "pytest workspace fact")])
+    global_store.promote([("key-decisions", "pytest global fact")])
+
+    session_a = MemoryProjector(
+        store,
+        global_store=global_store,
+        session_id="session-a",
+    )
+    session_b = MemoryProjector(
+        store,
+        global_store=global_store,
+        session_id="session-b",
+    )
+
+    a_text = session_a.project("pytest")
+    b_text = session_b.project("pytest")
+    global_text = session_b.project("pytest", include_global=True)
+
+    assert "pytest session-only fact" in a_text
+    assert "pytest session-only fact" not in b_text
+    assert "pytest workspace fact" in b_text
+    assert "pytest global fact" not in b_text
+    assert "pytest global fact" in global_text
+
+
+def test_memory_commands_require_explicit_global_opt_in(tmp_path: Path) -> None:
+    """/memory 默认不列 global，--global 才允许命令读取用户级 store。"""
+
+    session = AgentSession.create(
+        store=JsonlSessionStore(tmp_path / "session"),
+        session_id="session-command-scope",
+    )
+    global_store = DurableMemoryStore(tmp_path / "global-memory", global_store=True)
+    global_store.promote([("key-decisions", "pytest command global fact")])
+    session.memory_runtime.global_store = global_store
+    session.memory_projector.global_store = global_store
+    handler = MemoryCommandHandler(CurrentSessionState(session))
+
+    assert "pytest command global fact" not in handler.handle("/memory pytest").output
+    assert "pytest command global fact" in handler.handle("/memory --global pytest").output
 
 
 def test_memory_runtime_redacts_write_and_blocks_quarantine(tmp_path: Path, monkeypatch) -> None:
@@ -162,6 +259,8 @@ def test_memory_commands_close_capture_promote_and_retrieve_loop(tmp_path: Path)
     assert note["evidence"]["session_id"] == "sess_commands"
     assert session.tool_registry.names().count("memory_note") == 1
     assert session.tool_registry.names().count("memory_promote") == 1
+    assert session.memory_runtime.global_store is session.memory_projector.global_store
+    assert session.memory_runtime.global_store.global_store is True
     assert "memory_note" not in create_builtin_registry(tmp_path).names()
     assert "memory_promote" not in create_builtin_registry(tmp_path).names()
 
@@ -186,13 +285,22 @@ def test_remember_parser_preserves_ambiguous_natural_language(tmp_path: Path) ->
     assert session.memory_store.load_index() == []
 
 
+def test_global_flag_parser_preserves_body_token() -> None:
+    assert _split_global_flag("note about --global behavior") == (
+        False,
+        "note about --global behavior",
+    )
+    assert _split_global_flag("--global note") == (True, "note")
+    assert _split_global_flag("note --global") == (True, "note")
+
+
 def test_remember_parser_requires_topic_after_promote_flag(tmp_path: Path) -> None:
     session = AgentSession.create(store=JsonlSessionStore(tmp_path), session_id="sess_parser_usage")
     handler = MemoryCommandHandler(CurrentSessionState(session))
 
     result = handler.handle("/remember pytest uses fixtures --promote")
 
-    assert result.output == "Usage: /remember <text> [--promote <topic>]"
+    assert result.output == "Usage: /remember <text> [--promote <topic>] [--global]"
     assert not daily_log_path(session.memory_store.root).exists()
 
 
@@ -264,6 +372,34 @@ def test_agent_loop_injects_memory_into_budget_but_not_stable_prefix(tmp_path: P
     assert budget.fixed_tokens >= 1
     assert sum(len(message.content) for message in request_messages) > 0
     assert len([event for event in session.store.list_events(session.session_id) if event.type == "memory_retrieved"]) == 1
+
+
+def test_agent_loop_does_not_inject_unfiltered_index_or_other_session_notes(tmp_path: Path) -> None:
+    """自动 prompt 只能包含过滤后的命中，不得回显 MEMORY.md 全索引。"""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = DurableMemoryStore(workspace / ".firstcoder" / "memory", workspace_root=workspace)
+    store.upsert_topic(
+        MemoryNote(
+            topic="key-decisions",
+            text="pytest session-a only fact",
+            evidence=MemoryEvidence(session_id="session-a", visibility="session"),
+        )
+    )
+    store.upsert_topic(
+        MemoryNote(
+            topic="dependency-facts",
+            text="pytest session-b secret context",
+            evidence=MemoryEvidence(session_id="session-b", visibility="session"),
+        )
+    )
+    projector = MemoryProjector(store, workspace_root=workspace, session_id="session-a")
+
+    projection = projector.project("pytest")
+
+    assert "pytest session-a only fact" in projection
+    assert "pytest session-b secret context" not in projection
 
 
 def test_memory_tags_only_write_on_normal_final_response(tmp_path: Path) -> None:

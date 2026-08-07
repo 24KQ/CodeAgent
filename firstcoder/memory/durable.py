@@ -8,7 +8,7 @@ or interleaved across processes.
 
 Layout: `MEMORY.md` index + `topics/<topic>.md` + `<topic>.metadata.jsonl`
 sidecar, note_id = sha256(topic + text)[:12], evidence{source_path,
-session_id, anchor_hash, scope}. Implements the P0 `MemoryStorePort`
+  session_id, anchor_hash, scope, visibility}. Implements the P0 `MemoryStorePort`
 shape. The daily-log evidence sidecar (per-entry provenance) is the
 FirstCoder extension that lets the P0 port's `source` argument survive
 capture until promotion.
@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Iterator
 
 from firstcoder.memory.logs import ENTRYPOINT_NAME, append_to_daily_log, daily_lock_path, ensure_memory_dir
-from firstcoder.memory.models import MemoryEvidence, MemoryNote
+from firstcoder.memory.models import MEMORY_VISIBILITIES, MemoryEvidence, MemoryNote
 from firstcoder.memory.paths import ensure_no_link_or_junction, validate_memory_root
 from firstcoder.memory.provenance import (
     apply_evidence_staleness,
@@ -105,7 +105,16 @@ def _tokenize(text: str) -> set[str]:
 
 
 class DurableMemoryStore:
-    def __init__(self, root: str | Path, workspace_root: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        workspace_root: str | Path | None = None,
+        *,
+        global_store: bool = False,
+    ) -> None:
+        if global_store and workspace_root is not None:
+            raise ValueError("global memory store cannot be bound to a workspace")
+        self.global_store = bool(global_store)
         if workspace_root is not None:
             # P1（Codex P2 review #1）：root 必须在 workspace 内，越界立即拒绝——
             # 否则 memory 写入可被导向任意目录。
@@ -251,10 +260,54 @@ class DurableMemoryStore:
     def _scope(self) -> str:
         """scope 值：提供 workspace_root 时用真实 fingerprint（跨 workspace
         隔离由检索比较 fingerprint 实现）；否则用字面量标记"按 workspace
-        限定"（旧数据/无 workspace 上下文的兼容值）。"""
+        限定"（旧数据/无 workspace 上下文的兼容值）。global store 使用
+        ``global``，避免把用户级记录误当成无上下文的 workspace 记录。"""
+        if self.global_store:
+            return "global"
         if self.workspace_root is not None:
             return workspace_fingerprint(self.workspace_root)
         return "workspace_fingerprint"
+
+    def _default_visibility(self) -> str:
+        """Return the visibility used for rows created directly by this store.
+
+        `MemoryRuntime.record` overrides this with ``session`` before a note is
+        promoted. Direct store writes are durable promotions, so they retain
+        the historical workspace default unless the store is global.
+        """
+
+        return "global" if self.global_store else "workspace"
+
+    @staticmethod
+    def _check_visibility(value: object) -> str:
+        """校验 metadata visibility，防止未知字符串绕过读取过滤。
+
+        ``scope`` 仍然保存 workspace fingerprint；只有这里的三个枚举值
+        才能决定 session/workspace/global 的读取语义。数据文件是外部可编辑
+        的，因此读取和写入两侧都要把非法值当成格式错误处理。
+        """
+
+        normalized = str(value or "").strip()
+        if normalized not in MEMORY_VISIBILITIES:
+            raise ValueError(f"unsupported memory visibility: {normalized!r}")
+        return normalized
+
+    @staticmethod
+    def _legacy_visibility(row: dict, default: str = "workspace") -> str:
+        """Map old metadata rows to the new visibility field.
+
+        P2 rows have no visibility field. Their fingerprint scope already meant
+        workspace visibility, while the literal ``global`` was the only global
+        marker. Existing durable notes therefore must not silently become
+        session-private after the schema extension.
+        """
+
+        value = str(row.get("visibility") or "").strip()
+        if value in MEMORY_VISIBILITIES:
+            return value
+        if str(row.get("scope") or "").strip() == "global":
+            return "global"
+        return default
 
     def _default_note_metadata(self, topic: str, note_text: str, topic_path: Path | None = None) -> dict:
         topic_path = Path(topic_path) if topic_path is not None else self._topic_path(topic)
@@ -277,6 +330,7 @@ class DurableMemoryStore:
                 "evidence_anchor_hash": "",
             },
             "scope": self._scope(),
+            "visibility": self._default_visibility(),
         }
 
     def _metadata_for_note(self, topic: str, note_text: str, metadata: dict, topic_path: Path | None = None) -> dict:
@@ -288,6 +342,13 @@ class DurableMemoryStore:
         default_evidence = self._default_note_metadata(topic, note_text, topic_path=topic_path)["evidence"]
         evidence = row.get("evidence") if isinstance(row.get("evidence"), dict) else {}
         default_evidence.update(evidence)
+        if self.global_store:
+            # A global note cannot safely retain a workspace-relative evidence
+            # path: the same path would have a different meaning in another
+            # workspace. Keep session provenance, but never hash/read a path
+            # without a workspace root.
+            default_evidence["source_path"] = None
+            default_evidence["evidence_anchor_hash"] = ""
         # 证据锚点默认生成（pico memory.py:853-857，Codex P2 review #8）：
         # source_path 存在且 anchor 缺失时按当前文件内容自动计算——内容在
         # 捕获后变更会立即表现为 stale_evidence。
@@ -304,6 +365,12 @@ class DurableMemoryStore:
             default_evidence["evidence_anchor_hash"] = ""
         row["evidence"] = default_evidence
         row.setdefault("scope", self._scope())
+        visibility = self._check_visibility(
+            self._legacy_visibility(row, default=self._default_visibility())
+        )
+        row["visibility"] = "global" if self.global_store else visibility
+        if self.global_store:
+            row["scope"] = "global"
         return row
 
     def load_topic_notes(self, topic: str) -> list[dict]:
@@ -356,6 +423,10 @@ class DurableMemoryStore:
             ) != (row.get("evidence") or {}).get("evidence_anchor_hash"):
                 # 锚点回填（source_path 存在时自动计算，Codex P2 review #3）：
                 # 已有 row 补上 anchor 也必须落盘，否则每次读取重复计算。
+                metadata_changed = True
+            elif stored.get("visibility") != row.get("visibility"):
+                # 旧 metadata 没有 visibility；首次读取时补齐迁移字段，
+                # 但不改变其原有 workspace/global 语义。
                 metadata_changed = True
             metadata[row["note_id"]] = row
         if metadata_changed:
@@ -534,6 +605,11 @@ class DurableMemoryStore:
         quarantine 判定由 promote 统一负责（与 pico 语义一致）：
         这里只补 evidence / supersedes，不覆盖 status。
         """
+        requested_visibility = self._check_visibility(note.evidence.visibility)
+        if note.evidence.scope == "global":
+            requested_visibility = "global"
+        if self.global_store and requested_visibility != "global":
+            raise ValueError("global memory store accepts only global notes")
         self.promote([(note.topic, note.text)])
         self._apply_note_metadata(note)
 
@@ -553,13 +629,13 @@ class DurableMemoryStore:
                 evidence = dict(row.get("evidence") or {})
                 if note.evidence.session_id:
                     evidence["session_id"] = note.evidence.session_id
-                if note.evidence.source_path:
+                if note.evidence.source_path and not self.global_store:
                     evidence["source_path"] = note.evidence.source_path
                 if note.evidence.anchor_hash:
                     evidence["evidence_anchor_hash"] = note.evidence.anchor_hash
                 # 锚点缺失时按 source 文件当前内容自动生成（同
                 # `_metadata_for_note`，Codex P2 review #8）。
-                if not evidence.get("evidence_anchor_hash") and evidence.get("source_path"):
+                if not self.global_store and not evidence.get("evidence_anchor_hash") and evidence.get("source_path"):
                     anchor = compute_anchor_hash(
                         source_path_for_evidence(self.workspace_root, evidence.get("source_path"))
                     )
@@ -569,6 +645,8 @@ class DurableMemoryStore:
                 # sidecar/metadata 在同一份证据契约中出现两种空值。
                 if not evidence.get("evidence_anchor_hash"):
                     evidence["evidence_anchor_hash"] = ""
+                if self.global_store:
+                    evidence["source_path"] = None
                 row["evidence"] = evidence
             # scope 落在 row 顶层（`_default_note_metadata` 约定）；
             # 显式契约 scope（如 "global"）必须持久化；默认值 "workspace"
@@ -577,6 +655,13 @@ class DurableMemoryStore:
             # 检索 scope_mismatch）。
             if note.evidence.scope and note.evidence.scope != "workspace":
                 row["scope"] = note.evidence.scope
+            visibility = note.evidence.visibility
+            if note.evidence.scope == "global":
+                visibility = "global"
+            if self.global_store:
+                visibility = "global"
+                row["scope"] = "global"
+            row["visibility"] = visibility
             if note.supersedes:
                 row["supersedes"] = note.supersedes
             self._write_topic_metadata(note.topic, metadata)
@@ -605,6 +690,7 @@ class DurableMemoryStore:
                                 # scope 落在 metadata row 顶层（`_default_note_metadata`），
                                 # 不在 evidence dict 里——契约映射从这里回填。
                                 scope=str(note.get("scope") or evidence.get("scope") or "workspace"),
+                                visibility=self._check_visibility(self._legacy_visibility(note)),
                             ),
                             created_at=str(note.get("created_at", "")),
                         )

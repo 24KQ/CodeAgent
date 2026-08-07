@@ -11,13 +11,20 @@ from firstcoder.utils.schema import object_schema
 def create_memory_promote_tool(runtime: MemoryRuntime) -> Tool:
     """创建显式提升 durable topic 的 session-scoped 工具。"""
 
-    def memory_promote(*, topic: str, text: str) -> ToolResult:
+    def memory_promote(*, topic: str, text: str, visibility: str = "workspace") -> ToolResult:
         if not isinstance(topic, str) or not topic.strip():
             return make_error_result("memory_promote", "topic 不能为空")
         if not isinstance(text, str) or not text.strip():
             return make_error_result("memory_promote", "text 不能为空")
+        if visibility not in {"session", "workspace", "global"}:
+            return make_error_result("memory_promote", "visibility 必须是 session、workspace 或 global")
         try:
-            receipt = runtime.promote(topic, text, source="tool:memory_promote")
+            receipt = runtime.promote(
+                topic,
+                text,
+                source="tool:memory_promote",
+                visibility=visibility,
+            )
         except Exception:  # noqa: BLE001 - 工具结果不能泄漏原始 secret 或路径
             return make_error_result("memory_promote", "durable memory 提升失败")
         if not receipt.ok:
@@ -39,6 +46,11 @@ def create_memory_promote_tool(runtime: MemoryRuntime) -> Tool:
                 "enum": ["project-conventions", "key-decisions", "dependency-facts", "user-preferences"],
             },
             "text": {"type": "string"},
+            "visibility": {
+                "type": "string",
+                "enum": ["session", "workspace", "global"],
+                "default": "workspace",
+            },
         },
         required=["topic", "text"],
     )

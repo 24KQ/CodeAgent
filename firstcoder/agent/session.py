@@ -38,7 +38,7 @@ from firstcoder.tools.types import Tool, ToolResult, make_error_result
 from firstcoder.context.models import AgentMessage, MessagePart, SessionView
 from firstcoder.input.attachments import UserAttachment, prepare_attachments_for_session
 from firstcoder.memory.durable import DurableMemoryStore
-from firstcoder.memory.paths import default_memory_root
+from firstcoder.memory.paths import default_global_memory_root, default_memory_root
 from firstcoder.memory.prompt import MemoryProjector
 from firstcoder.memory.redact import MemoryRedactor
 from firstcoder.memory.runtime import MemoryRuntime
@@ -737,6 +737,12 @@ def _build_memory_components(
         default_memory_root(resolved_workspace),
         workspace_root=resolved_workspace,
     )
+    # Global memory 使用独立的用户级目录；仅把 store 注入当前 session，默认
+    # 查询仍关闭 include_global，避免“能访问”被误解为“自动注入”。
+    global_memory_store = DurableMemoryStore(
+        default_global_memory_root(),
+        global_store=True,
+    )
 
     def append_memory_audit(event_type: str, payload: dict[str, object]) -> None:
         if event_type == "memory_recorded":
@@ -755,6 +761,7 @@ def _build_memory_components(
                     if selection.selected
                 ],
                 "selected_count": len(result.selected_notes),
+                "include_global": result.query.include_global,
             }
         )
 
@@ -763,10 +770,13 @@ def _build_memory_components(
         session_id=session_id,
         security=memory_redactor,
         audit=append_memory_audit,
+        global_store=global_memory_store,
     )
     memory_projector = MemoryProjector(
         memory_store,
         workspace_root=resolved_workspace,
+        session_id=session_id,
+        global_store=global_memory_store,
         security=memory_redactor,
         audit=append_retrieval_audit,
     )
