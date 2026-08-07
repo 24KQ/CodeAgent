@@ -6,9 +6,6 @@ Textual widget 只负责显示和输入；这里把“当前 session 可被 resu
 
 from __future__ import annotations
 
-from firstcoder.input.attachments import UserAttachment
-from firstcoder.utils.text import ellipsis_truncate
-
 import asyncio
 import json
 import threading
@@ -18,23 +15,25 @@ from typing import Any
 
 import anyio
 
-from firstcoder.runtime.cancellation import CancellationToken
-from firstcoder.tools.hidden import HIDDEN_TOOL_STATUS_NAMES
-from firstcoder.agent.loop import AgentLoop, ToolExecutionEvent
 from firstcoder.agent.background import BackgroundJobManager
+from firstcoder.agent.loop import AgentLoop, ToolExecutionEvent
 from firstcoder.agent.loop_limits import AgentLoopLimits
 from firstcoder.agent.session import AgentSession
 from firstcoder.agent.user_input import AgentTurnStatus
-from firstcoder.runtime.user_input import UserInputRequest
 from firstcoder.context.context_builder import ContextBuilder
 from firstcoder.context.models import AgentMessage, MessagePart, SessionView
+from firstcoder.context.runtime_state import SessionRuntimeState
+from firstcoder.input.attachments import UserAttachment
 from firstcoder.memory.prompt import MemoryProjector
 from firstcoder.memory.runtime import MemoryRuntime
-from firstcoder.context.runtime_state import SessionRuntimeState
 from firstcoder.permissions.types import PermissionMode
 from firstcoder.providers.base import ChatProvider
 from firstcoder.providers.types import ChatResponse, ChatStreamEvent, MainRequestOptions
+from firstcoder.runtime.cancellation import CancellationToken
+from firstcoder.runtime.user_input import UserInputRequest
+from firstcoder.tools.hidden import HIDDEN_TOOL_STATUS_NAMES
 from firstcoder.tools.types import Tool
+from firstcoder.utils.text import ellipsis_truncate
 
 
 @dataclass(slots=True)
@@ -98,6 +97,8 @@ class AgentChatRunner:
     context_manager: Any | None = None
     limits: AgentLoopLimits | None = None
     use_streaming: bool = False
+    # readiness_mode 只传给普通 AgentLoop 的 run recorder，默认 warn 保持旧行为。
+    readiness_mode: str = "warn"
     request_options: MainRequestOptions = field(default_factory=MainRequestOptions)
     context_window: int | None = None
     loops: list[AgentLoop] = field(default_factory=list)
@@ -299,6 +300,7 @@ class AgentChatRunner:
             "guidance_provider": self.drain_guidance,
             "cancellation_token": cancellation_token,
             "background_manager": self.background_manager,
+            "readiness_mode": self.readiness_mode,
         }
         if streaming:
             kwargs["stream_event_handler"] = self.stream_event_handler

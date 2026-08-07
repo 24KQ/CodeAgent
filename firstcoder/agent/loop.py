@@ -9,21 +9,23 @@ from typing import Literal
 
 import anyio
 
-from firstcoder.runtime.cancellation import AgentCancelledError, CancellationToken
-from firstcoder.runtime.user_input import UserInputRequest
-from firstcoder.agent.ports import ContextManagerLike
-from firstcoder.agent.loop_limits import AgentLoopLimits, AgentLoopStopReason
-from firstcoder.agent.session import AgentSession, PendingPermissionExecution
-from firstcoder.agent.task_boundary_classifier import TaskBoundaryClassifier
-from firstcoder.agent.task_plan_policy import TaskPlanPolicy, render_current_task_plan_snapshot
-from firstcoder.agent.tool_execution import ToolExecutionEvent, ToolExecutor
-from firstcoder.agent.tool_settlement import ToolCallSettlement
 from firstcoder.agent.background import (
     DEFAULT_BACKGROUND_TOOL_NAMES,
     BackgroundJobManager,
     render_task_notification,
     with_background_controls,
 )
+from firstcoder.agent.loop_limits import AgentLoopLimits, AgentLoopStopReason
+from firstcoder.agent.ports import ContextManagerLike
+from firstcoder.agent.session import AgentSession, PendingPermissionExecution
+from firstcoder.agent.subagent import SubagentRunner
+from firstcoder.agent.task_boundary_classifier import TaskBoundaryClassifier
+from firstcoder.agent.task_plan_policy import (
+    TaskPlanPolicy,
+    render_current_task_plan_snapshot,
+)
+from firstcoder.agent.tool_execution import ToolExecutionEvent, ToolExecutor
+from firstcoder.agent.tool_settlement import ToolCallSettlement
 from firstcoder.agent.user_input import (
     AgentTurnResult,
     AgentTurnStatus,
@@ -31,23 +33,45 @@ from firstcoder.agent.user_input import (
 from firstcoder.context.context_builder import ContextBuilder
 from firstcoder.context.identity import new_request_id, stable_json_hash
 from firstcoder.context.manager import ContextCompactRequest, ContextWindowTrigger
-from firstcoder.context.token_budget import ContextBudget, build_context_budget
+from firstcoder.context.store import (
+    SessionLoadError,
+    SessionPersistenceError,
+    SessionStoreCorruptError,
+)
 from firstcoder.context.task_boundary import TaskBoundaryService
+from firstcoder.context.token_budget import ContextBudget, build_context_budget
+from firstcoder.harness.recorder import RunRecorder
 from firstcoder.input.attachments import UserAttachment
 from firstcoder.memory.prompt import extract_memory_tags
-from firstcoder.permissions.types import PermissionDecision, PermissionDecisionKind, PermissionRequest
+from firstcoder.permissions.types import (
+    PermissionDecision,
+    PermissionDecisionKind,
+    PermissionRequest,
+)
 from firstcoder.providers.base import ChatProvider
 from firstcoder.providers.errors import ProviderError, ProviderErrorKind
-from firstcoder.providers.types import ChatMessage, ChatRequest, ChatResponse, ChatStreamEvent, MainRequestOptions, ToolCall
+from firstcoder.providers.types import (
+    ChatMessage,
+    ChatRequest,
+    ChatResponse,
+    ChatStreamEvent,
+    MainRequestOptions,
+    ToolCall,
+)
+from firstcoder.runtime.cancellation import AgentCancelledError, CancellationToken
+from firstcoder.runtime.user_input import UserInputRequest
+from firstcoder.session.errors import SessionError
+from firstcoder.tools.background import (
+    create_background_cancel_tool,
+    create_background_status_tool,
+)
+from firstcoder.tools.delegate import create_delegate_tool
+from firstcoder.tools.hidden import HIDDEN_TOOL_STATUS_NAMES
 from firstcoder.tools.permission_results import (
     make_permission_denied_result,
     make_prewrite_review_failed_result,
     make_prewrite_review_stale_result,
 )
-from firstcoder.tools.background import create_background_cancel_tool, create_background_status_tool
-from firstcoder.agent.subagent import SubagentRunner
-from firstcoder.tools.delegate import create_delegate_tool
-from firstcoder.tools.hidden import HIDDEN_TOOL_STATUS_NAMES
 from firstcoder.tools.types import Tool, ToolResult, make_error_result
 
 
@@ -57,6 +81,7 @@ class PreparedMainRequest:
     request_id: str
     projection_fingerprint: str
     tool_result_part_ids: tuple[str, ...]
+    context_budget: ContextBudget
 
 
 class AgentLoop:
@@ -93,6 +118,7 @@ class AgentLoop:
         background_manager: BackgroundJobManager | None = None,
         background_tool_names: frozenset[str] | None = None,
         enable_delegate_tool: bool = True,
+        readiness_mode: str = "warn",
     ) -> None:
         self.session = session
         self.tool_settlement = ToolCallSettlement(session)
@@ -115,6 +141,10 @@ class AgentLoop:
         self.background_manager = background_manager
         self.background_tool_names = background_tool_names if background_tool_names is not None else DEFAULT_BACKGROUND_TOOL_NAMES
         self.enable_delegate_tool = enable_delegate_tool
+        self.readiness_mode = readiness_mode
+        # 一个 AgentLoop 对应一个用户请求的 run。权限确认恢复会复用同一个
+        # loop，因此 recorder 也必须挂在 loop 上，而不能由 UI 每次重新创建。
+        self.run_recorder: RunRecorder | None = None
         self._task_plan_reconciliation_attempted = False
         self._tool_rounds_completed = 0
         self.task_boundary_classifier = TaskBoundaryClassifier(
@@ -164,11 +194,15 @@ class AgentLoop:
     ) -> AgentTurnResult:
         """Execute one turn through the single asynchronous AgentTurnResult API."""
 
-        if streaming:
-            return await self._run_user_turn_streaming(content, attachments=attachments)
-        return await anyio.to_thread.run_sync(
-            lambda: self._run_user_turn_sync(content, attachments=attachments)
-        )
+        try:
+            if streaming:
+                return await self._run_user_turn_streaming(content, attachments=attachments)
+            return await anyio.to_thread.run_sync(
+                lambda: self._run_user_turn_sync(content, attachments=attachments)
+            )
+        except Exception as exc:
+            self._record_harness_failure(exc)
+            raise
 
     def replace_cancellation_token(self, token: CancellationToken | None) -> None:
         """Rebind cooperative cancellation when a paused turn resumes in the runner."""
@@ -178,6 +212,74 @@ class AgentLoop:
 
     def clear_stream_events(self) -> None:
         self.last_stream_events = []
+
+    def _ensure_run_recorder(self, user_request: str) -> None:
+        """为当前 loop 延迟创建 run recorder。"""
+
+        if self.run_recorder is None or self.run_recorder.finished:
+            self.run_recorder = RunRecorder(
+                session=self.session,
+                user_request=user_request,
+                readiness_mode=self.readiness_mode,
+            )
+            self.run_recorder.start()
+
+    def _record_harness_failure(self, error: Exception) -> None:
+        """异常离开 loop 时尽力写出失败 run，不遮盖原始异常。"""
+
+        if self.run_recorder is None:
+            return
+        error_type = _harness_error_type(error, fallback="runtime")
+        try:
+            self.run_recorder.fail(error, error_type=error_type)
+        except Exception:  # noqa: BLE001 - preserve the original runtime error
+            # harness 写盘失败不能把原始 provider/tool 错误替换成第二个错误；
+            # 原始异常仍由调用方处理，失败 run 的缺口会在审计中暴露。
+            return
+
+    def _resumed_user_request(self) -> str:
+        """从 session 尾部恢复权限确认对应的原始用户请求。"""
+
+        for message in reversed(self.session.rebuild_view().messages):
+            if message.role == "user":
+                return "\n".join(part.content for part in message.parts if part.content)
+        return ""
+
+    def _ensure_resume_run_recorder(self) -> None:
+        """恢复前先建立 recorder，确保读取失败也能留下终局证据。"""
+
+        try:
+            user_request = self._resumed_user_request()
+        except Exception:
+            # 原始请求本身来自 session log；此处失败时没有可用文本，但仍要
+            # 创建 recorder，让外层异常处理可以写出 resume_load_error。
+            self._ensure_run_recorder("")
+            raise
+        self._ensure_run_recorder(user_request)
+
+    def _record_provider_requested(self, prepared: PreparedMainRequest) -> None:
+        """在真正发请求前记录 provider call 的 request 侧事实。"""
+
+        if self.run_recorder is not None:
+            self.run_recorder.record_provider_requested(prepared, self.provider)
+
+    def _record_provider_response(self, prepared: PreparedMainRequest, response: ChatResponse) -> None:
+        """在 provider 返回后记录 usage、finish reason 与 request 配对关系。"""
+
+        if self.run_recorder is not None:
+            self.run_recorder.record_provider_response(prepared, self.provider, response)
+
+    def _record_provider_error(self, prepared: PreparedMainRequest, error: Exception) -> None:
+        """记录 provider 失败或取消，保留两者在 harness 中的不同错误分类。"""
+
+        if self.run_recorder is not None:
+            error_type = _harness_error_type(error, fallback="provider")
+            self.run_recorder.record_provider_error(
+                prepared,
+                self.provider,
+                error,
+                error_type=error_type,
+            )
 
     def _run_user_turn_sync(
         self,
@@ -196,11 +298,12 @@ class AgentLoop:
                 pending_input=self.tool_executor.permission_input_request_from_pending(pending),
             )
 
-        self._begin_turn()
-        self._repair_interrupted_tool_calls_before_provider_request()
-        self._check_cancelled()
-        message_id = self.session.append_user_message(content, attachments=attachments)
         try:
+            self._ensure_run_recorder(content)
+            self._begin_turn()
+            self._repair_interrupted_tool_calls_before_provider_request()
+            self._check_cancelled()
+            message_id = self.session.append_user_message(content, attachments=attachments)
             if self._initialize_active_task_if_missing(message_id) is None:
                 self._classify_task_boundary(message_id)
         except _AgentLoopLimitReached as exc:
@@ -221,11 +324,15 @@ class AgentLoop:
     ) -> AgentTurnResult:
         """Resume a paused turn through the single asynchronous result API."""
 
-        if streaming:
-            return await self._resume_with_user_input_streaming(request_id, answer)
-        return await anyio.to_thread.run_sync(
-            lambda: self._resume_with_user_input_sync(request_id, answer)
-        )
+        try:
+            if streaming:
+                return await self._resume_with_user_input_streaming(request_id, answer)
+            return await anyio.to_thread.run_sync(
+                lambda: self._resume_with_user_input_sync(request_id, answer)
+            )
+        except Exception as exc:
+            self._record_harness_failure(exc)
+            raise
 
     def _resume_with_user_input_sync(self, request_id: str, answer: str) -> AgentTurnResult:
         """用用户回答恢复一个暂停中的权限确认。
@@ -236,6 +343,7 @@ class AgentLoop:
         """
 
         try:
+            self._ensure_resume_run_recorder()
             self._check_turn_timeout()
             self._check_cancelled()
         except _AgentLoopLimitReached as exc:
@@ -254,6 +362,7 @@ class AgentLoop:
         """流式模式下恢复权限确认，并继续消费 provider stream。"""
 
         try:
+            self._ensure_resume_run_recorder()
             self._check_turn_timeout()
             self._check_cancelled()
         except _AgentLoopLimitReached as exc:
@@ -288,11 +397,12 @@ class AgentLoop:
                 pending_input=pending_input,
             )
 
-        self._begin_turn()
-        self._repair_interrupted_tool_calls_before_provider_request()
-        self._check_cancelled()
-        message_id = self.session.append_user_message(content, attachments=attachments)
         try:
+            self._ensure_run_recorder(content)
+            self._begin_turn()
+            self._repair_interrupted_tool_calls_before_provider_request()
+            self._check_cancelled()
+            message_id = self.session.append_user_message(content, attachments=attachments)
             if self._initialize_active_task_if_missing(message_id) is None:
                 await self._classify_task_boundary_async(message_id)
         except _AgentLoopLimitReached as exc:
@@ -371,26 +481,32 @@ class AgentLoop:
     ) -> PendingPermissionExecution | AgentTurnResult:
         pending = self.session.pending_permission_execution
         if pending is None or pending.request_id != request_id:
-            return AgentTurnResult(
-                status=AgentTurnStatus.COMPLETED,
-                response=ChatResponse(
-                    provider=self.provider.name,
-                    model=self.provider.model,
-                    content="没有找到可恢复的权限确认请求。",
-                    finish_reason="error",
-                ),
+            return self._permission_resume_error_result(
+                "没有找到可恢复的权限确认请求。",
             )
         if self.session.permission_manager is None:
-            return AgentTurnResult(
-                status=AgentTurnStatus.COMPLETED,
-                response=ChatResponse(
-                    provider=self.provider.name,
-                    model=self.provider.model,
-                    content="当前会话没有权限管理器，无法恢复权限确认。",
-                    finish_reason="error",
-                ),
+            return self._permission_resume_error_result(
+                "当前会话没有权限管理器，无法恢复权限确认。",
             )
         return pending
+
+    def _permission_resume_error_result(self, content: str) -> AgentTurnResult:
+        """恢复请求无效时返回等待态，保留 pending permission run 不提前终结。"""
+
+        pending_input = None
+        pending = self.session.pending_permission_execution
+        if pending is not None and self.session.permission_manager is not None:
+            pending_input = self.tool_executor.permission_input_request_from_pending(pending)
+        return AgentTurnResult(
+            status=AgentTurnStatus.WAITING_FOR_USER_INPUT,
+            response=ChatResponse(
+                provider=self.provider.name,
+                model=self.provider.model,
+                content=content,
+                finish_reason="error",
+            ),
+            pending_input=pending_input,
+        )
 
     def _prepare_permission_resume(
         self,
@@ -505,7 +621,13 @@ class AgentLoop:
         self._reserve_provider_call()
         self._check_turn_timeout()
         self._check_cancelled()
-        response = self.provider.complete(prepared.request)
+        self._record_provider_requested(prepared)
+        try:
+            response = self.provider.complete(prepared.request)
+        except Exception as exc:
+            self._record_provider_error(prepared, exc)
+            raise
+        self._record_provider_response(prepared, response)
         self._record_projection_consumed(prepared)
         return response
 
@@ -567,18 +689,24 @@ class AgentLoop:
         self._reserve_provider_call()
         self._check_turn_timeout()
         self._check_cancelled()
-        async for event in self.provider.astream(prepared.request):
-            self._check_cancelled()
-            self.last_stream_events.append(event)
-            if self.stream_event_handler is not None:
-                self.stream_event_handler(event)
-            if event.kind == "message_completed":
-                final_response = event.response
-        if final_response is None:
-            raise ProviderError(
-                ProviderErrorKind.API_ERROR,
-                "provider stream ended without message_completed event",
-            )
+        self._record_provider_requested(prepared)
+        try:
+            async for event in self.provider.astream(prepared.request):
+                self._check_cancelled()
+                self.last_stream_events.append(event)
+                if self.stream_event_handler is not None:
+                    self.stream_event_handler(event)
+                if event.kind == "message_completed":
+                    final_response = event.response
+            if final_response is None:
+                raise ProviderError(
+                    ProviderErrorKind.API_ERROR,
+                    "provider stream ended without message_completed event",
+                )
+        except Exception as exc:
+            self._record_provider_error(prepared, exc)
+            raise
+        self._record_provider_response(prepared, final_response)
         self._record_projection_consumed(prepared)
         return final_response
 
@@ -738,6 +866,8 @@ class AgentLoop:
         if _is_normal_memory_capture_response(response):
             for entry in extract_memory_tags(response.content):
                 self.session.memory_runtime.record(entry, source="final_answer")
+        if self.run_recorder is not None:
+            self.run_recorder.finish(response)
         return AgentTurnResult(status=AgentTurnStatus.COMPLETED, response=response)
 
     def _continue_tool_loop_from_response(
@@ -855,6 +985,16 @@ class AgentLoop:
         permission_request: PermissionRequest | None = None,
         prewrite_review: dict[str, object] | None = None,
     ) -> None:
+        if self.run_recorder is not None:
+            self.run_recorder.record_tool_event(
+                ToolExecutionEvent(
+                    kind=kind,
+                    tool_call=tool_call,
+                    result=result,
+                    permission_request=permission_request,
+                    prewrite_review=prewrite_review,
+                )
+            )
         if self.tool_event_handler is None:
             return
         self.tool_event_handler(
@@ -884,23 +1024,19 @@ class AgentLoop:
             runtime_instruction=runtime_instruction,
             definitions=definitions,
         )
-        if self.context_manager is not None:
-            result = self.context_manager.compact_if_needed(
-                ContextCompactRequest(
-                    view=view,
-                    runtime_state=self.session.runtime_state,
-                    budget=budget,
-                    estimate_budget=lambda candidate: self._context_budget_for_view(
-                        candidate,
-                        runtime_instruction=runtime_instruction,
-                        definitions=definitions,
-                    ),
-                    trigger=ContextWindowTrigger.AUTO,
-                    current_turn=self.session.current_turn,
-                )
+        context_result = self._compact_if_needed(
+            trigger=ContextWindowTrigger.AUTO,
+            runtime_instruction=runtime_instruction,
+        )
+        if context_result is not None and context_result.status == "success":
+            view = self.session.rebuild_view()
+            # 压缩会改变真正发送给 provider 的历史；重新计算预算，不能把
+            # 压缩前的 token 数和 pressure tier 写进 model_requested 证据。
+            budget = self._context_budget_for_view(
+                view,
+                runtime_instruction=runtime_instruction,
+                definitions=definitions,
             )
-            if result.status == "success":
-                view = self.session.rebuild_view()
 
         messages = self._request_messages(
             view=view,
@@ -908,7 +1044,7 @@ class AgentLoop:
             record_memory_event=True,
         )
         request = self._main_chat_request(messages, definitions, tool_choice)
-        return PreparedMainRequest(
+        prepared = PreparedMainRequest(
             request=request,
             request_id=new_request_id(),
             projection_fingerprint=stable_json_hash(
@@ -919,7 +1055,11 @@ class AgentLoop:
                 length=24,
             ),
             tool_result_part_ids=self.context_builder.projected_tool_result_part_ids(view),
+            context_budget=budget,
         )
+        if self.run_recorder is not None:
+            self.run_recorder.record_prompt_built(prepared, self.provider)
+        return prepared
 
     def _record_projection_consumed(self, prepared: PreparedMainRequest) -> None:
         self.session.record_provider_projection_consumed(
@@ -976,7 +1116,7 @@ class AgentLoop:
             runtime_instruction=runtime_instruction,
             definitions=definitions,
         )
-        return self.context_manager.compact_if_needed(
+        result = self.context_manager.compact_if_needed(
             ContextCompactRequest(
                 view=view,
                 runtime_state=self.session.runtime_state,
@@ -990,6 +1130,16 @@ class AgentLoop:
                 current_turn=self.session.current_turn,
             )
         )
+        if self.run_recorder is not None and result is not None:
+            # 统一记录 AUTO、task-hash 和 prompt-too-long 三类压缩入口；
+            # 使用 result.view 的预算，让 context evidence 反映压缩后的视图。
+            result_budget = self._context_budget_for_view(
+                result.view,
+                runtime_instruction=runtime_instruction,
+                definitions=definitions,
+            )
+            self.run_recorder.record_context_decision(result, result_budget)
+        return result
 
     def _compact_for_prompt_too_long(self, *, runtime_instruction: str | None = None):
         return self._compact_if_needed(
@@ -1288,6 +1438,22 @@ class _AgentLoopLimitReached(Exception):
     def __init__(self, reason: AgentLoopStopReason) -> None:
         super().__init__(reason.value)
         self.reason = reason
+
+
+def _harness_error_type(error: Exception, *, fallback: str) -> str:
+    """把 loop/provider 异常归一为 harness 的终局错误类别。"""
+
+    if isinstance(error, AgentCancelledError):
+        return "cancelled"
+    if isinstance(error, ProviderError):
+        if error.kind == ProviderErrorKind.USER_ABORT:
+            return "cancelled"
+        return "provider"
+    if isinstance(error, SessionPersistenceError):
+        return "persistence"
+    if isinstance(error, (SessionLoadError, SessionStoreCorruptError, SessionError)):
+        return "resume"
+    return fallback
 
 
 def _memory_query_from_view(view) -> str:

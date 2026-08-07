@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 from firstcoder.context.checkpoint import Checkpoint
 from firstcoder.context.events import SessionEvent
@@ -25,6 +25,14 @@ class SessionStoreCorruptError(ValueError):
     """A persisted event cannot be replayed into a trustworthy session view."""
 
 
+class SessionPersistenceError(OSError):
+    """会话事件已经进入写入边界，但底层持久化失败。"""
+
+
+class SessionLoadError(ValueError):
+    """会话事件无法从磁盘读取或解析，不能安全用于恢复。"""
+
+
 class JsonlSessionStore:
     """append-only JSONL store。
 
@@ -39,12 +47,19 @@ class JsonlSessionStore:
 
     def append_event(self, event: SessionEvent) -> None:
         path = self._session_path(event.session_id)
-        with path.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(event.to_dict(), ensure_ascii=False, sort_keys=True))
-            file.write("\n")
-        from firstcoder.session.index import SessionIndex
+        try:
+            with path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(event.to_dict(), ensure_ascii=False, sort_keys=True))
+                file.write("\n")
+            from firstcoder.session.index import SessionIndex
 
-        SessionIndex(self.root).update_event(event)
+            SessionIndex(self.root).update_event(event)
+        except OSError as exc:
+            # JSONL 追加和 session index 更新都属于同一个持久化边界；即使事件
+            # 已追加但 index 更新失败，也必须让上层知道这不是普通运行时异常。
+            raise SessionPersistenceError(
+                f"failed to persist session event for {event.session_id}: {exc}"
+            ) from exc
 
     def list_events(self, session_id: str) -> list[SessionEvent]:
         path = self._session_path(session_id)
@@ -52,10 +67,17 @@ class JsonlSessionStore:
             return []
 
         events: list[SessionEvent] = []
-        with path.open("r", encoding="utf-8") as file:
-            for line in file:
-                if line.strip():
-                    events.append(SessionEvent.from_dict(json.loads(line)))
+        try:
+            with path.open("r", encoding="utf-8") as file:
+                for line in file:
+                    if line.strip():
+                        events.append(SessionEvent.from_dict(json.loads(line)))
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            # resume 必须区分“日志损坏/不可读”和业务运行时错误；保留 cause 供
+            # 调试，同时给 harness 一个稳定的 resume_load_error 分类入口。
+            raise SessionLoadError(
+                f"failed to load session {session_id}: {exc}"
+            ) from exc
         return events
 
     def rebuild_session_view(self, session_id: str) -> SessionView:

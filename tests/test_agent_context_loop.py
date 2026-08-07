@@ -3849,6 +3849,7 @@ def test_agent_loop_permission_resume_rejects_unknown_request_id(tmp_path) -> No
     loop._run_user_turn_sync("写 README")
     result = loop._resume_with_user_input_sync("perm_wrong", "allow_once")
 
+    assert result.status == AgentTurnStatus.WAITING_FOR_USER_INPUT
     assert result.response is not None
     assert result.response.finish_reason == "error"
     assert "没有找到" in result.response.content

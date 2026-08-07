@@ -144,7 +144,12 @@ class TraceWriter:
                     # task_state 再中断 run（文档语义，Codex P1 review fix）。
                     critical_exc = exc
                     break
-        self.run_store.write_task_state(task_state)
+        # TaskState 与 trace 一样属于 run artifact；不能因为它不是 event payload
+        # 就绕过同一套递归脱敏规则。
+        self.run_store.write_task_state(
+            task_state,
+            payload=self.redactor.redact_artifact(task_state.to_dict()),
+        )
         if critical_exc is not None:
             raise critical_exc
         return built

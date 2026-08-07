@@ -6,9 +6,9 @@ prompt-estimation persistence, no protocol/base URL, no request<->response
 pairing. Before the H5 context-cost pairing experiment can exist, every
 provider call must record this metadata.
 
-This module is the contract. The wiring at the loop call site lands with
-the stop_reason mapping slice (P1 切片 4); until then nothing calls it and
-existing behavior is unchanged.
+This module is the contract. 普通 AgentLoop 的运行时接线由
+firstcoder.harness.recorder.RunRecorder 负责，provider adapter 通过
+ChatProvider.protocol 提供协议标识；harness 不反向识别具体 SDK。
 """
 
 from __future__ import annotations

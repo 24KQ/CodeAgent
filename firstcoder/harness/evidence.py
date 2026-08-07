@@ -27,6 +27,26 @@ CONTINUE_KIND = "continue"
 TERMINAL_KIND = "terminal"
 TRANSITION_SUMMARY_SCHEMA = "firstcoder.transition_summary.v1"
 
+# prompt_built 描述的是下一次请求的最新预算，但它本身没有携带上一次 L4
+# 压缩的事实。报告需要保留本 run 已经发生过的压缩证据，不能因后续预算事件
+# 的 reducer 更新而把 compact_call_usage 清成 None。
+_COMPACTION_SUMMARY_FIELDS = (
+    "reductions",
+    "summary_called",
+    "summary_mode",
+    "summary_delta_event_count",
+    "compact_call_usage",
+    "compact_net_benefit_tokens",
+    "compact_summary_has_next_steps",
+    "compact_summary_has_file_references",
+    "pre_compact_estimated_tokens",
+    "post_compact_estimated_tokens",
+    "replacement_cache_hits",
+    "replacement_records_created",
+    "replacement_ledger_enabled",
+    "saved_chars",
+)
+
 
 def build_transition(
     *,
@@ -110,9 +130,12 @@ def update_evidence_summaries(
             summaries.get("transition_summary", {}), event
         )
     elif event_name == "prompt_built":
-        summaries["context_budget_summary"] = context_budget_summary(
-            event.get("prompt_metadata", {})
+        current = context_budget_summary(event.get("prompt_metadata", {}))
+        _preserve_compaction_summary(
+            current,
+            summaries.get("context_budget_summary", {}),
         )
+        summaries["context_budget_summary"] = current
     elif event_name == "context_orchestrator_decision":
         summaries["context_budget_summary"] = update_from_orchestrator(
             summaries.get("context_budget_summary", {}), event
@@ -139,3 +162,17 @@ def update_evidence_summaries(
             summaries.get("final_readiness_summary", {}), event
         )
     return summaries
+
+
+def _preserve_compaction_summary(
+    current: dict[str, Any],
+    previous: dict[str, Any] | None,
+) -> None:
+    """在更新最新预算时保留本 run 的已有压缩证据。"""
+
+    previous = dict(previous or {})
+    for key in _COMPACTION_SUMMARY_FIELDS:
+        current_value = current.get(key)
+        previous_value = previous.get(key)
+        if current_value in (None, "", 0, False, []) and previous_value not in (None, "", 0, False, []):
+            current[key] = previous_value

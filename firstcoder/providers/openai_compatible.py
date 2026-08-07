@@ -104,6 +104,12 @@ class OpenAICompatibleProvider(ChatProvider):
         return self._model
 
     @property
+    def protocol(self) -> str:
+        """向 harness 暴露稳定协议名，避免上层根据 adapter 模块名猜测。"""
+
+        return "openai-compatible"
+
+    @property
     def capabilities(self) -> ProviderCapabilities:
         return self._capabilities
 
