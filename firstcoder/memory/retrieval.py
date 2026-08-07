@@ -27,6 +27,7 @@ from firstcoder.memory.models import (
     MemoryEvidence,
     MemoryNote,
     MemoryQuery,
+    MEMORY_VISIBILITIES,
     RetrievalResult,
     RetrievalSelection,
 )
@@ -80,12 +81,32 @@ def _note_to_contract(note: dict) -> MemoryNote:
             anchor_hash=str(evidence.get("evidence_anchor_hash") or ""),
             # scope 在 note dict 顶层（metadata row），不在 evidence dict 里。
             scope=str(note.get("scope") or evidence.get("scope") or "workspace"),
+            # 统一经过 legacy 推断，避免旧 metadata 或非法值在契约对象中
+            # 伪装成一个调用方无法处理的 visibility。
+            visibility=_legacy_visibility(note),
         ),
         created_at=str(note.get("created_at", "")),
     )
 
 
-def _retrieval_reject_reason(note: dict, workspace_root: str | None = None) -> str:
+def _legacy_visibility(note: dict) -> str:
+    """Infer visibility for P2 rows that predate the explicit field."""
+
+    value = str(note.get("visibility") or "").strip()
+    if value in MEMORY_VISIBILITIES:
+        return value
+    if str(note.get("scope") or "").strip() == "global":
+        return "global"
+    return "workspace"
+
+
+def _retrieval_reject_reason(
+    note: dict,
+    workspace_root: str | None = None,
+    *,
+    session_id: str = "",
+    include_global: bool = False,
+) -> str:
     status = str(note.get("status", "active")).strip() or "active"
     if status == "quarantined":
         return "quarantined"
@@ -93,8 +114,27 @@ def _retrieval_reject_reason(note: dict, workspace_root: str | None = None) -> s
         return "superseded"
     if bool(note.get("stale_evidence")):
         return "stale_evidence"
+    raw_visibility = str(note.get("visibility") or "").strip()
+    if raw_visibility and raw_visibility not in MEMORY_VISIBILITIES:
+        # state 可能来自旧进程或外部 fixture，不能把篡改值静默降级为
+        # workspace；没有专门的 reject enum 时按 scope mismatch fail-closed。
+        return "scope_mismatch"
+    visibility = _legacy_visibility(note)
+    if visibility == "global":
+        if not include_global:
+            return "global_disabled"
+    elif visibility == "session":
+        evidence = note.get("evidence") if isinstance(note.get("evidence"), dict) else {}
+        note_session_id = str(evidence.get("session_id") or note.get("session_id") or "")
+        if not session_id or note_session_id != session_id:
+            return "session_mismatch"
+    elif visibility not in {"workspace"}:
+        return "scope_mismatch"
+
+    # workspace fingerprint remains a separate compatibility/access field;
+    # visibility must not overwrite its meaning.
     scope = str(note.get("scope", "")).strip()
-    if scope and scope != "global":
+    if visibility in {"session", "workspace"} and scope and scope != "global":
         if scope == "workspace_fingerprint":
             pass  # 字面量标记（无 workspace 上下文写入的兼容值）：不比较
         elif workspace_root is not None and re.fullmatch(r"[0-9a-f]{12}", scope):
@@ -118,7 +158,9 @@ class MemoryRetriever:
 
     用法：可只传 `state`（episodic 检索），也可传 `store`（durable 检索）；
     `workspace_root` 用于 fingerprint scope 比较与 evidence staleness
-    判定（与 `promote` 写 scope 时的 workspace 一致）。
+    判定（与 `promote` 写 scope 时的 workspace 一致）；`session_id` 用于
+    session-only 记忆过滤；global store 只有 query 明确 include_global 时
+    才会读取。
     """
 
     def __init__(
@@ -126,9 +168,13 @@ class MemoryRetriever:
         store: DurableMemoryStore | None = None,
         state: dict | None = None,
         workspace_root: str | None = None,
+        session_id: str = "",
+        global_store: DurableMemoryStore | None = None,
     ) -> None:
         self.store = store
+        self.global_store = global_store
         self.state = dict(state or {})
+        self.session_id = str(session_id or "")
         # 未显式传 workspace_root 时继承 store 的上下文（Codex P2 review #3）：
         # 配置了 workspace_root 的 store 不应在检索时被"无上下文"重解析
         # （fingerprint 比较会误判 scope_mismatch）。
@@ -136,7 +182,7 @@ class MemoryRetriever:
             workspace_root if workspace_root is not None else getattr(store, "workspace_root", None)
         )
 
-    def _iter_notes(self) -> Any:
+    def _iter_notes(self, *, include_global: bool = False) -> Any:
         for note in self.state.get("episodic_notes", []):
             yield dict(note)
         if self.store is not None:
@@ -144,11 +190,45 @@ class MemoryRetriever:
             # 避免一次查询跨锁读到不同代次的数据。
             for note in self.store.snapshot(self.workspace_root):
                 yield note
+        if include_global and self.global_store is not None and self.global_store is not self.store:
+            # Global notes have no workspace evidence root. They are read only
+            # after the caller explicitly opts in through MemoryQuery.
+            for note in self.global_store.snapshot(None):
+                yield note
 
-    def _ranked(self, query: str) -> list[tuple[tuple[int, int, float, int], float, dict]]:
+    def visible_notes(self, query: MemoryQuery | None = None) -> list[MemoryNote]:
+        """返回当前上下文允许读取的全部 note，不执行关键词排名。
+
+        ``/memory`` 需要列出可见内容，但不能把 ``MEMORY.md`` 当成权限边界：
+        index 只知道 topic，不知道 session/global 过滤结果。这个公开方法复用
+        与普通检索完全相同的拒绝规则，作为命令和其他展示层的统一读取入口。
+        """
+
+        context = query or MemoryQuery(text="")
+        session_id = context.session_id or self.session_id
+        visible: list[MemoryNote] = []
+        for note in self._iter_notes(include_global=context.include_global):
+            reject_reason = _retrieval_reject_reason(
+                note,
+                self.workspace_root,
+                session_id=session_id,
+                include_global=context.include_global,
+            )
+            if reject_reason == "quarantined" and context.include_quarantined:
+                reject_reason = ""
+            if not reject_reason:
+                visible.append(_note_to_contract(note))
+        return visible
+
+    def _ranked(
+        self,
+        query: str,
+        *,
+        include_global: bool = False,
+    ) -> list[tuple[tuple[int, int, float, int], float, dict]]:
         query_tokens = _tokenize(query)
         ranked = []
-        for note in self._iter_notes():
+        for note in self._iter_notes(include_global=include_global):
             note_tags = {tag.lower() for tag in note.get("tags", [])}
             note_tokens = _tokenize(note.get("text", "")) | _tokenize(note.get("source", "")) | note_tags
             exact_tag_match = int(bool(query_tokens & note_tags))
@@ -177,8 +257,13 @@ class MemoryRetriever:
     def retrieve(self, query: MemoryQuery) -> RetrievalResult:
         selected: list[RetrievalSelection] = []
         rejected: list[RetrievalSelection] = []
-        for _, score, note in self._ranked(query.text):
-            reject_reason = _retrieval_reject_reason(note, self.workspace_root)
+        for _, score, note in self._ranked(query.text, include_global=query.include_global):
+            reject_reason = _retrieval_reject_reason(
+                note,
+                self.workspace_root,
+                session_id=query.session_id or self.session_id,
+                include_global=query.include_global,
+            )
             if reject_reason == "quarantined" and query.include_quarantined:
                 reject_reason = ""
             if reject_reason:

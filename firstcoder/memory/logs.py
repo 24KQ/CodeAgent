@@ -95,6 +95,7 @@ def append_to_daily_log(
                 "source_path": source.source_path,
                 "evidence_anchor_hash": source.anchor_hash,
                 "scope": source.scope,
+                "visibility": source.visibility,
                 "at": datetime.now().astimezone().isoformat(),
             }
             existing_evidence = evidence_path.read_text(encoding="utf-8") if evidence_path.exists() else ""

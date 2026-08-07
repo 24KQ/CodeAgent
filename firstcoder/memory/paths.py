@@ -19,6 +19,17 @@ def default_memory_root(workspace_root: Path) -> Path:
     return Path(workspace_root) / ".firstcoder" / "memory"
 
 
+def default_global_memory_root() -> Path:
+    """Return the explicit user-level store used by global memories.
+
+    Global memory is intentionally outside a project workspace so it can be
+    shared by multiple workspaces. The caller must still opt in to reading it;
+    merely constructing the path never makes global notes part of a request.
+    """
+
+    return Path.home() / ".firstcoder" / "memory"
+
+
 def validate_memory_root(root: Path, workspace_root: Path) -> Path:
     """Resolve `root` and require it to live inside `workspace_root`.
 

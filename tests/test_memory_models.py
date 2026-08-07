@@ -22,6 +22,7 @@ def test_evidence_defaults() -> None:
     assert evidence.session_id == ""
     assert evidence.anchor_hash == ""
     assert evidence.scope == "workspace"
+    assert evidence.visibility == "workspace"
 
 
 def test_note_defaults() -> None:
@@ -43,6 +44,8 @@ def test_query_defaults() -> None:
     query = MemoryQuery(text="pytest")
     assert query.limit == 5
     assert query.include_quarantined is False
+    assert query.session_id == ""
+    assert query.include_global is False
 
 
 def test_selection_reject_reason() -> None:

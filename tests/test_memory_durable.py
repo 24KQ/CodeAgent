@@ -433,6 +433,49 @@ def test_upsert_persists_scope(tmp_path: Path) -> None:
     assert rows[note_id_for("key-decisions", "pytest note")]["scope"] == "global"
 
 
+def test_global_store_rejects_non_global_note(tmp_path: Path) -> None:
+    """global store 不能被 workspace/session note 误写。"""
+
+    store = DurableMemoryStore(tmp_path / "global-memory", global_store=True)
+    with pytest.raises(ValueError, match="global memory store accepts only global notes"):
+        store.upsert_topic(
+            MemoryNote(
+                topic="key-decisions",
+                text="workspace-only note",
+                evidence=MemoryEvidence(visibility="workspace"),
+            )
+        )
+
+
+def test_legacy_metadata_visibility_migrates_without_changing_scope(tmp_path: Path) -> None:
+    """P2 metadata 无 visibility 时按旧 scope 推断并回填新字段。"""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = DurableMemoryStore(workspace / ".firstcoder" / "memory", workspace_root=workspace)
+    store.promote([("key-decisions", "legacy workspace fact")])
+    note_id = note_id_for("key-decisions", "legacy workspace fact")
+    rows = store._load_topic_metadata("key-decisions")
+    rows[note_id].pop("visibility", None)
+    store._write_topic_metadata("key-decisions", rows)
+
+    store.load_topic_notes("key-decisions")
+
+    migrated = store._load_topic_metadata("key-decisions")[note_id]
+    assert migrated["visibility"] == "workspace"
+    assert len(str(migrated["scope"])) == 12
+
+    global_store = DurableMemoryStore(tmp_path / "global-memory", global_store=True)
+    global_store.promote([("key-decisions", "legacy global fact")])
+    global_id = note_id_for("key-decisions", "legacy global fact")
+    global_rows = global_store._load_topic_metadata("key-decisions")
+    global_rows[global_id].pop("visibility", None)
+    global_store._write_topic_metadata("key-decisions", global_rows)
+    global_store.load_topic_notes("key-decisions")
+
+    assert global_store._load_topic_metadata("key-decisions")[global_id]["visibility"] == "global"
+
+
 def test_upsert_default_scope_keeps_fingerprint(tmp_path: Path) -> None:
     """默认 evidence scope 不得覆盖 store 生成的真实 workspace fingerprint。"""
     from firstcoder.memory.provenance import workspace_fingerprint
