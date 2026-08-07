@@ -14,7 +14,10 @@ from firstcoder.context.llm_compact import (
     normalize_coding_handoff,
 )
 from firstcoder.context.models import AgentMessage
-from firstcoder.context.tool_sequence import InvalidToolCallSequenceError, validate_tool_call_sequence
+from firstcoder.context.tool_sequence import (
+    InvalidToolCallSequenceError,
+    validate_tool_call_sequence,
+)
 from firstcoder.providers.base import ChatProvider
 from firstcoder.providers.errors import ProviderError, ProviderErrorKind
 from firstcoder.providers.types import ChatMessage, ChatRequest
@@ -67,6 +70,7 @@ class ProviderLlmCompactSummarizer(LlmCompactSummarizer):
             summary=normalize_coding_handoff(summary),
             tail_start_message_id=tail.tail_start_message_id,
             covered_until_message_id=tail.covered_until_message_id,
+            usage=response.usage,
         )
 
 

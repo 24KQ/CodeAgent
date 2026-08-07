@@ -26,6 +26,24 @@ class ChatProvider(ABC):
     def model(self) -> str:
         """当前 provider 默认使用的模型名称。"""
 
+    @property
+    def protocol(self) -> str:
+        """返回 provider 对外使用的协议标识，未知实现默认视为 custom。"""
+
+        return "custom"
+
+    @property
+    def base_url(self) -> str | None:
+        """返回可用于审计的 endpoint；不暴露具体 SDK client。"""
+
+        return None
+
+    @property
+    def prompt_cache_key(self) -> str:
+        """返回 provider prompt cache identity，未知实现使用空值。"""
+
+        return ""
+
     @abstractmethod
     def complete(self, request: ChatRequest) -> ChatResponse:
         """同步生成一次回复。"""

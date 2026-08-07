@@ -103,17 +103,19 @@ class RunStore:
     def artifacts_dir(self, run_id: object) -> Path:
         return self.run_dir(run_id) / "artifacts"
 
-    def start_run(self, task_state: object) -> Path:
-        """One user request maps to one run directory of independent artifacts."""
+    def start_run(self, task_state: object, *, task_state_payload: dict | None = None) -> Path:
+        """为一轮请求创建独立目录，并允许调用方传入已脱敏的 state 快照。"""
         run_dir = self.run_dir(task_state)
         run_dir.mkdir(parents=True, exist_ok=True)
-        self.write_task_state(task_state)
+        self.write_task_state(task_state, payload=task_state_payload)
         return run_dir
 
-    def write_task_state(self, task_state: object) -> Path:
+    def write_task_state(self, task_state: object, *, payload: dict | None = None) -> Path:
+        """原子写入 state；payload 用于避免持久化层绕过 artifact 脱敏。"""
+
         path = self.task_state_path(task_state)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_json_atomic(path, task_state.to_dict())
+        self._write_json_atomic(path, payload if payload is not None else task_state.to_dict())
         return path
 
     def append_trace(self, task_state: object, event: dict) -> Path:

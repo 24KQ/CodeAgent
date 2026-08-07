@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, Literal
+from typing import Any, Literal, Protocol
 
-from firstcoder.context.checkpoint import Checkpoint, CheckpointIndex, checkpoint_summary_content
+from firstcoder.context.checkpoint import (
+    Checkpoint,
+    CheckpointIndex,
+    checkpoint_summary_content,
+)
 from firstcoder.context.events import SessionEvent
 from firstcoder.context.identity import new_event_id, stable_json_hash
 from firstcoder.context.models import AgentMessage, MessagePart, SessionView
 from firstcoder.context.retry_policy import CompactRetryPolicy
-from firstcoder.context.runtime_state import SessionRuntimeState, auto_compact_circuit_is_open
+from firstcoder.context.runtime_state import (
+    SessionRuntimeState,
+    auto_compact_circuit_is_open,
+)
 from firstcoder.context.store import JsonlSessionStore
-from firstcoder.context.tool_sequence import InvalidToolCallSequenceError, validate_tool_call_sequence
+from firstcoder.context.tool_sequence import (
+    InvalidToolCallSequenceError,
+    validate_tool_call_sequence,
+)
 from firstcoder.context.versions import CHECKPOINT_STRATEGY_VERSION
 
 CompactMode = Literal["auto", "manual"]
@@ -58,6 +68,8 @@ class LlmCompactSummary:
     summary: str
     tail_start_message_id: str
     covered_until_message_id: str
+    # provider summarizer 可选返回 token usage；本地 fixture 不需要提供它。
+    usage: Any | None = None
 
 
 class LlmCompactSummarizer(Protocol):
@@ -89,6 +101,8 @@ class LlmCompactEvent:
     checkpoint_id: str | None = None
     fallback_steps: list[dict[str, object]] | None = None
     final_failure_reason: str | None = None
+    # L4 provider 的实际 usage 进入 context evidence，供 cost reducer 计费。
+    compact_call_usage: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +176,7 @@ class LlmCompactService:
                         source_fingerprint=source_fingerprint,
                         retry_count=retries,
                         checkpoint_id=checkpoint.id,
+                        compact_call_usage=_usage_payload(summary.usage),
                     ),
                 )
             except UnconsumedLlmCheckpointBoundaryError:
@@ -395,7 +410,25 @@ def _summarize(
         summary=normalize_coding_handoff(summary.summary),
         tail_start_message_id=summary.tail_start_message_id,
         covered_until_message_id=summary.covered_until_message_id,
+        usage=summary.usage,
     )
+
+
+def _usage_payload(usage: Any) -> dict[str, object] | None:
+    """把 provider 的摘要调用 usage 归一化为 cost reducer 使用的字段。"""
+
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        get_value = usage.get
+    else:
+        get_value = lambda key, default=None: getattr(usage, key, default)
+    return {
+        "input_tokens": get_value("input_tokens"),
+        "output_tokens": get_value("output_tokens"),
+        "total_tokens": get_value("total_tokens"),
+        "cached_tokens": get_value("cached_tokens", get_value("cached_input_tokens")),
+    }
 
 
 def normalize_coding_handoff(summary: str) -> str:

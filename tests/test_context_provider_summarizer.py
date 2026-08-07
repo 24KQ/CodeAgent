@@ -15,7 +15,7 @@ from firstcoder.context.models import AgentMessage, MessagePart
 from firstcoder.context.provider_summarizer import ProviderLlmCompactSummarizer
 from firstcoder.providers.base import ChatProvider
 from firstcoder.providers.errors import ProviderError, ProviderErrorKind
-from firstcoder.providers.types import ChatRequest, ChatResponse
+from firstcoder.providers.types import ChatRequest, ChatResponse, TokenUsage
 
 EXPECTED_CODING_HANDOFF_HEADINGS = (
     "## 当前目标",
@@ -49,7 +49,14 @@ class FakeProvider(ChatProvider):
 
 
 def test_provider_summarizer_requests_plain_summary_without_tools() -> None:
-    provider = FakeProvider(ChatResponse(provider="fake", model="fake-model", content="摘要"))
+    provider = FakeProvider(
+        ChatResponse(
+            provider="fake",
+            model="fake-model",
+            content="摘要",
+            usage=TokenUsage(input_tokens=40, output_tokens=12, total_tokens=52),
+        )
+    )
 
     summary = ProviderLlmCompactSummarizer(provider).summarize(
         [
@@ -63,6 +70,7 @@ def test_provider_summarizer_requests_plain_summary_without_tools() -> None:
     assert summary.summary.count("## ") == 7
     assert summary.covered_until_message_id == "msg_1"
     assert summary.tail_start_message_id == "msg_2"
+    assert summary.usage.total_tokens == 52
     assert provider.requests[0].tools == []
     assert provider.requests[0].tool_choice == "none"
 

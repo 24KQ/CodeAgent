@@ -76,7 +76,7 @@ def map_turn_outcome(
     终局（Codex P1 review fix）。
 
     失败路径也走 finish_reason 映射（不限于 completed 状态）：真实
-    provider 异常在 loop 里直接抛出，P5 接线时以 error_type="provider"
+    provider 异常在 loop 里直接抛出，P4.1 接线时以 error_type="provider"
     或 finish_reason="error" 落到这里。
     """
     if error_type == "persistence":
