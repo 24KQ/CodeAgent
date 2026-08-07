@@ -61,7 +61,11 @@ class TestRunCommand:
         result = run_command(["missing_cmd"], cwd=tmp_path)
 
         assert result.ok is False
-        assert "No such file or directory" in result.error
+        assert result.exit_code == -1
+        assert result.error is not None
+        # OSError 的具体文案由操作系统和本地化语言决定，只断言
+        # run_command 约定的稳定前缀，避免 Windows 与 POSIX 文案差异。
+        assert result.error.startswith("命令执行失败：")
 
     def test_stdout_truncation(self, tmp_path):
         result = run_command([sys.executable, "-c", "print('abcdefghij', end='')"], cwd=tmp_path, max_output_chars=5)
@@ -165,4 +169,7 @@ class TestRunCommand:
 
         assert result.ok is False
         assert result.error == "命令已中断"
-        assert elapsed < 2
+        # Windows 通过 taskkill 回收进程树，系统调度抖动可能略超过 2 秒；
+        # 仍要求它早于子进程自然结束（5 秒），避免把取消误判为等待超时。
+        cancellation_deadline = 5 if os.name == "nt" else 2
+        assert elapsed < cancellation_deadline

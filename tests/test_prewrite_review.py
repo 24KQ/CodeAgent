@@ -2,8 +2,26 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from firstcoder.providers.types import ToolCall
 from firstcoder.tools.review import build_prewrite_review
+
+
+def _create_symlink_or_skip(link: Path, target: Path) -> None:
+    """创建测试链接；当前主机不具备链接权限时跳过该平台测试。
+
+    这些测试验证的是预览逻辑不跟随链接读取目标内容。Windows 普通账户
+    可能因开发者模式或管理员权限未开启而无法创建 symlink，这属于测试
+    环境能力差异，不应把同一安全行为标记为产品失败。
+    """
+
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"当前环境无法创建 symlink：{exc}")
 
 
 def test_write_review_describes_new_file_without_writing(tmp_path) -> None:
@@ -180,7 +198,7 @@ def test_recursive_delete_review_does_not_follow_symlink_contents(tmp_path) -> N
     outside.write_text("do not expose this secret", encoding="utf-8")
     target = tmp_path / "cache"
     target.mkdir()
-    (target / "secret-link").symlink_to(outside)
+    _create_symlink_or_skip(target / "secret-link", outside)
 
     review = build_prewrite_review(
         tmp_path,
@@ -204,7 +222,7 @@ def test_single_symlink_delete_review_tracks_link_not_target_contents(tmp_path) 
     second_target = tmp_path / "second-target.txt"
     second_target.write_text("second", encoding="utf-8")
     link = tmp_path / "target-link"
-    link.symlink_to(first_target)
+    _create_symlink_or_skip(link, first_target)
 
     review = build_prewrite_review(
         tmp_path,
@@ -216,5 +234,5 @@ def test_single_symlink_delete_review_tracks_link_not_target_contents(tmp_path) 
     first_target.write_text("changed target contents", encoding="utf-8")
     assert review.is_current(tmp_path) is True
     link.unlink()
-    link.symlink_to(second_target)
+    _create_symlink_or_skip(link, second_target)
     assert review.is_current(tmp_path) is False
