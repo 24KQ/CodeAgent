@@ -114,6 +114,11 @@ def _retrieval_reject_reason(
         return "superseded"
     if bool(note.get("stale_evidence")):
         return "stale_evidence"
+    raw_visibility = str(note.get("visibility") or "").strip()
+    if raw_visibility and raw_visibility not in MEMORY_VISIBILITIES:
+        # state 可能来自旧进程或外部 fixture，不能把篡改值静默降级为
+        # workspace；没有专门的 reject enum 时按 scope mismatch fail-closed。
+        return "scope_mismatch"
     visibility = _legacy_visibility(note)
     if visibility == "global":
         if not include_global:

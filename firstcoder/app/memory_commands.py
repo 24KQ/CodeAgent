@@ -63,7 +63,7 @@ class MemoryCommandHandler:
         # MEMORY.md；否则 session-only/global 条目会绕过读取边界。
         index = self.session.memory_projector.render_index(include_global=include_global)
         if not index:
-            return "No durable memories yet. Use /remember <text> to capture one."
+            return "No visible durable memories for this session."
         return index
 
     def _remember(self, raw: str) -> str:

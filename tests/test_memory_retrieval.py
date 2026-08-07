@@ -199,6 +199,19 @@ def test_global_visibility_requires_explicit_opt_in() -> None:
     assert [s.text for s in opted_in.selected_notes] == ["pytest global note"]
 
 
+def test_invalid_visibility_is_rejected_instead_of_falling_back_to_workspace() -> None:
+    state = {
+        "episodic_notes": [
+            _state_note("pytest tampered visibility", visibility="cross-session")
+        ]
+    }
+
+    result = _retriever(state).retrieve(MemoryQuery(text="pytest"))
+
+    assert result.selected_notes == []
+    assert result.selections[0].reject_reason == "scope_mismatch"
+
+
 def test_session_visibility_requires_matching_session() -> None:
     state = {
         "episodic_notes": [

@@ -161,6 +161,8 @@ class MemoryRuntime:
                     visibility="global",
                 )
             target_store = self.global_store
+            # _apply_note_metadata 会把 workspace 占位 scope 改成 global；
+            # global store 同时清除 source_path，保证跨项目读取没有错误根目录。
 
         topic_text = str(topic or "").strip()
         original = self._normalize_text(text)
