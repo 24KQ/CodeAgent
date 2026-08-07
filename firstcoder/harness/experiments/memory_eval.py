@@ -454,6 +454,184 @@ def _rate_delta(left: Mapping[str, Any] | None, right: Mapping[str, Any] | None)
     return round(float(left["rate"]) - float(right["rate"]), 4)
 
 
+def correlate_memory_audit_events(
+    events: Iterable[Mapping[str, Any] | Any],
+) -> dict[str, Any]:
+    """关联 memory audit、prompt 和 provider facts，并标记证据可信度。
+
+    session JSONL 的 ``memory_retrieved`` 与 run trace 的 ``prompt_built``、
+    ``model_requested``/``model_parsed`` 属于两个持久化边界，不能靠事件相邻
+    顺序直接声称它们属于同一次请求。只要 memory 事件同时带有
+    ``request_id`` 和 ``projection_fingerprint``，且两个键都能在 prompt/provider
+    facts 中闭合，结果才标记为 ``high``；旧版本没有关联键的事件最多标记为
+    ``fallback``，并且整体 ``claimable`` 保持 False，避免把历史弱关联数据当作
+    P5.3 的高可信 benchmark 证据。若多个 memory 事件复用同一二元键，则这些
+    行都会标记为 ``duplicate``；单行消费者也不能把它们误读为 high。
+
+    输出只包含稳定 ID、布尔值、计数和状态，不复制 provider prompt、回答或原始
+    memory 文本，因此可以安全地交给现有 artifact writer 做后续脱敏。
+    """
+
+    normalized = [_normalize_audit_event(event) for event in events]
+    memory_events = [payload for name, payload in normalized if name == "memory_retrieved"]
+    prompt_events = [
+        _event_metadata(payload, event_name=name)
+        for name, payload in normalized
+        if name == "prompt_built"
+    ]
+    provider_events = [
+        _event_metadata(payload, event_name=name)
+        for name, payload in normalized
+        if name in {"model_requested", "model_parsed"}
+    ]
+
+    associations: list[dict[str, Any]] = []
+    for index, memory_payload in enumerate(memory_events):
+        memory_meta = _event_metadata(memory_payload, event_name="memory_retrieved")
+        request_id = memory_meta["request_id"]
+        fingerprint = memory_meta["projection_fingerprint"]
+        has_pair = bool(request_id and fingerprint)
+        pair = (request_id, fingerprint) if has_pair else None
+        matched_prompts = [
+            payload for payload in prompt_events if pair is not None and _event_pair(payload) == pair
+        ]
+        matched_provider = [
+            payload for payload in provider_events if pair is not None and _event_pair(payload) == pair
+        ]
+
+        fallback_prompt = prompt_events[index] if index < len(prompt_events) else {}
+        if not has_pair:
+            # 旧事件没有二元键，只能借用同序 prompt 作为诊断线索；这条路径永远
+            # 不会提升为 high，也不把“恰好同序”当成稳定关联契约。
+            request_id = request_id or str(fallback_prompt.get("request_id") or "")
+            fingerprint = fingerprint or str(fallback_prompt.get("projection_fingerprint") or "")
+            if request_id:
+                matched_provider = [
+                    payload
+                    for payload in provider_events
+                    if str(payload.get("request_id") or "") == request_id
+                ]
+            elif index < len(provider_events):
+                matched_provider = [provider_events[index]]
+
+        if has_pair and matched_prompts and matched_provider:
+            confidence = "high"
+        elif not has_pair:
+            confidence = "fallback"
+        else:
+            confidence = "unmatched"
+
+        associations.append(
+            {
+                "request_id": _safe_identifier(request_id),
+                "projection_fingerprint": _safe_identifier(fingerprint),
+                "query_hash": _safe_identifier(memory_meta.get("query_hash", "")),
+                "selected_note_ids": [
+                    _safe_identifier(note_id)
+                    for note_id in memory_meta.get("selected_note_ids", [])
+                    if str(note_id)
+                ],
+                "include_global": bool(memory_meta.get("include_global", False)),
+                "projection_empty": bool(memory_meta.get("projection_empty", False)),
+                "confidence": confidence,
+                "prompt_built": bool(matched_prompts),
+                "provider_fact_count": len(matched_provider),
+            }
+        )
+
+    complete_pairs = [
+        (row["request_id"], row["projection_fingerprint"])
+        for row in associations
+        if row["confidence"] == "high"
+    ]
+    duplicate_pairs = {
+        pair for pair, count in Counter(complete_pairs).items() if count > 1
+    }
+    if duplicate_pairs:
+        # 先计算重复键，再逐行降级，避免只有聚合 claimable 变为 False、而
+        # 单行消费者仍看到 confidence=high 的不一致结果。
+        for row in associations:
+            pair = (row["request_id"], row["projection_fingerprint"])
+            if row["confidence"] == "high" and pair in duplicate_pairs:
+                row["confidence"] = "duplicate"
+
+    high_confidence_count = sum(row["confidence"] == "high" for row in associations)
+    fallback_count = sum(row["confidence"] == "fallback" for row in associations)
+    unmatched_count = sum(row["confidence"] == "unmatched" for row in associations)
+    duplicate_count = sum(row["confidence"] == "duplicate" for row in associations)
+    duplicate_key_count = len(duplicate_pairs)
+    return {
+        "schema_version": 1,
+        "artifact_type": "memory-audit-associations-v1",
+        "association_count": len(associations),
+        "high_confidence_count": high_confidence_count,
+        "fallback_count": fallback_count,
+        "unmatched_count": unmatched_count,
+        "duplicate_count": duplicate_count,
+        "duplicate_key_count": duplicate_key_count,
+        # 没有样本或包含任何弱关联时都不可作为 benchmark claim；这与
+        # MemoryMetricResult 的分母为零语义保持一致，宁可 n/a 也不虚报。
+        "claimable": (
+            bool(associations)
+            and high_confidence_count == len(associations)
+            and duplicate_key_count == 0
+        ),
+        "associations": associations,
+    }
+
+
+def evaluate_memory_audit_events(
+    events: Iterable[Mapping[str, Any] | Any],
+) -> dict[str, Any]:
+    """提供 evaluator 风格命名的兼容入口，逻辑集中在关联函数中。"""
+
+    return correlate_memory_audit_events(events)
+
+
+def _normalize_audit_event(event: Mapping[str, Any] | Any) -> tuple[str, dict[str, Any]]:
+    """兼容 SessionEvent 对象、session event mapping 和 trace mapping。"""
+
+    if isinstance(event, Mapping):
+        name = str(event.get("event") or event.get("type") or "")
+        payload = event.get("payload") if "payload" in event else event
+    else:
+        name = str(getattr(event, "event", "") or getattr(event, "type", "") or "")
+        payload = getattr(event, "payload", None)
+        if payload is None:
+            payload = event
+    return name, dict(payload) if isinstance(payload, Mapping) else {}
+
+
+def _event_metadata(payload: Mapping[str, Any], *, event_name: str) -> dict[str, Any]:
+    """提取关联键；只读取结构化 metadata，不触碰 prompt 或回答正文。"""
+
+    nested: dict[str, Any] = {}
+    if event_name == "prompt_built" and isinstance(payload.get("prompt_metadata"), Mapping):
+        nested.update(payload["prompt_metadata"])
+    for key in ("provider_call", "provider_call_metadata"):
+        if isinstance(payload.get(key), Mapping):
+            nested.update(payload[key])
+    merged = {**nested, **dict(payload)}
+    return {
+        "request_id": str(merged.get("request_id") or merged.get("call_id") or ""),
+        "projection_fingerprint": str(
+            merged.get("projection_fingerprint") or merged.get("prompt_hash") or ""
+        ),
+        "query_hash": str(merged.get("query_hash") or ""),
+        "selected_note_ids": list(merged.get("selected_note_ids") or []),
+        "include_global": bool(merged.get("include_global", False)),
+        "projection_empty": bool(merged.get("projection_empty", False)),
+    }
+
+
+def _event_pair(payload: Mapping[str, Any]) -> tuple[str, str] | None:
+    """返回完整关联键；缺一项即视为 legacy/不可高可信关联。"""
+
+    request_id = str(payload.get("request_id") or "")
+    fingerprint = str(payload.get("projection_fingerprint") or "")
+    return (request_id, fingerprint) if request_id and fingerprint else None
+
+
 def write_memory_eval_artifacts(payload: Mapping[str, Any], output_dir: str | Path) -> dict[str, str]:
     """用共享 writer 写出脱敏 JSON/CSV/Markdown memory benchmark artifacts。"""
 
@@ -1049,6 +1227,8 @@ __all__ = [
     "build_memory_fixture_cases",
     "challenge_fixture_cases",
     "contract_fixture_cases",
+    "correlate_memory_audit_events",
+    "evaluate_memory_audit_events",
     "evaluate_memory_cases",
     "render_memory_eval_report",
     "render_memory_evaluation_report",

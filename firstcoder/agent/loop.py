@@ -42,7 +42,7 @@ from firstcoder.context.task_boundary import TaskBoundaryService
 from firstcoder.context.token_budget import ContextBudget, build_context_budget
 from firstcoder.harness.recorder import RunRecorder
 from firstcoder.input.attachments import UserAttachment
-from firstcoder.memory.prompt import extract_memory_tags
+from firstcoder.memory.prompt import MemoryProjection, extract_memory_tags
 from firstcoder.permissions.types import (
     PermissionDecision,
     PermissionDecisionKind,
@@ -82,6 +82,9 @@ class PreparedMainRequest:
     projection_fingerprint: str
     tool_result_part_ids: tuple[str, ...]
     context_budget: ContextBudget
+    # 仅真实请求路径会把本次检索结果带到这里；预算试算不会创建
+    # PreparedMainRequest，因此不会有可提交的 memory audit。
+    memory_projection: MemoryProjection | None = None
 
 
 class AgentLoop:
@@ -145,6 +148,9 @@ class AgentLoop:
         # 一个 AgentLoop 对应一个用户请求的 run。权限确认恢复会复用同一个
         # loop，因此 recorder 也必须挂在 loop 上，而不能由 UI 每次重新创建。
         self.run_recorder: RunRecorder | None = None
+        # _request_messages 同时服务预算试算和真实请求。这个 pending 槽只在后者
+        # 开启，等完整 request/fingerprint 生成后立即消费，防止试算事件冒充事实。
+        self._pending_memory_projection: MemoryProjection | None = None
         self._task_plan_reconciliation_attempted = False
         self._tool_rounds_completed = 0
         self.task_boundary_classifier = TaskBoundaryClassifier(
@@ -1013,6 +1019,9 @@ class AgentLoop:
         tool_choice="auto",
         runtime_instruction: str | None = None,
     ) -> PreparedMainRequest:
+        # 每次重新准备请求都从空 pending 开始；这样 prompt-too-long 重试或异常
+        # 构造不会把上一次请求的 memory metadata 错绑到下一次 provider call。
+        self._pending_memory_projection = None
         self._repair_interrupted_tool_calls_before_provider_request()
         self._check_cancelled()
         self._append_pending_guidance()
@@ -1056,7 +1065,17 @@ class AgentLoop:
             ),
             tool_result_part_ids=self.context_builder.projected_tool_result_part_ids(view),
             context_budget=budget,
+            memory_projection=self._pending_memory_projection,
         )
+        if prepared.memory_projection is not None:
+            # request id 与完整 provider projection fingerprint 只有在 PreparedMainRequest
+            # 创建后才同时存在；在此之前写 audit 会丢失多请求关联能力。
+            self.session.append_memory_retrieval_audit(
+                request_id=prepared.request_id,
+                projection_fingerprint=prepared.projection_fingerprint,
+                projection=prepared.memory_projection,
+            )
+        self._pending_memory_projection = None
         if self.run_recorder is not None:
             self.run_recorder.record_prompt_built(prepared, self.provider)
         return prepared
@@ -1203,10 +1222,17 @@ class AgentLoop:
                     content=render_current_task_plan_snapshot(resolved_view.task_plan),
                 ),
             ]
-        memory_message = self.session.memory_projector.build_message(
+        memory_message, memory_projection = self.session.memory_projector.build_message_with_metadata(
             _memory_query_from_view(resolved_view),
-            record_audit=record_memory_event,
+            # AgentLoop 不直接走旧 callback；真实请求的 audit 在 PreparedMainRequest
+            # 生成后统一补齐 request/fingerprint，命令侧的旧 callback 仍保持兼容。
+            record_audit=False,
         )
+        if record_memory_event and memory_projection.query_hash:
+            # 只有非空 query 才真正执行过 MemoryRetriever。没有 query 时返回的
+            # 空 projection 只是“本轮无需检索”，不能伪造 memory_retrieved；但
+            # 有 query 而无 selected note 仍需保留 audit，供 abstention 指标使用。
+            self._pending_memory_projection = memory_projection
         if memory_message is not None:
             system_prefix = [*system_prefix, memory_message]
         return self._build_provider_messages(
