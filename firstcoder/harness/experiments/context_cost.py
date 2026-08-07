@@ -15,7 +15,7 @@ from __future__ import annotations
 import csv
 import json
 import statistics
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -223,8 +223,18 @@ def collect_rows_from_run_manifest(
 def write_experiment_artifacts(
     payload: dict[str, Any],
     output_dir: str | Path,
+    *,
+    markdown_renderer: Callable[[dict[str, Any]], str] | None = None,
+    include_usage_columns: bool = True,
 ) -> dict[str, str]:
-    """写入 JSON、CSV、Markdown 三种报告格式。"""
+    """写入 JSON、CSV、Markdown 三种报告格式。
+
+    ``markdown_renderer`` 让 memory benchmark 复用同一套文件写出逻辑，避免
+    为不同实验再复制一套 JSON/CSV flatten 代码；缺省仍使用 context-cost
+    原有报告。``include_usage_columns`` 默认开启，保持旧成本 artifact 的
+    CSV schema；没有 provider usage 的实验可以显式关闭这些列，避免伪造成本
+    证据。
+    """
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -232,8 +242,13 @@ def write_experiment_artifacts(
     csv_path = output / "paired_rows.csv"
     markdown_path = output / "report.md"
     json_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _write_rows_csv(payload.get("rows", []) or [], csv_path)
-    markdown_path.write_text(generate_report(payload) + "\n", encoding="utf-8")
+    _write_rows_csv(
+        payload.get("rows", []) or [],
+        csv_path,
+        include_usage_columns=include_usage_columns,
+    )
+    renderer = markdown_renderer or generate_report
+    markdown_path.write_text(renderer(payload) + "\n", encoding="utf-8")
     return {"json": str(json_path), "csv": str(csv_path), "markdown": str(markdown_path)}
 
 
@@ -504,21 +519,33 @@ def _p95_rounded(values: Iterable[float]) -> float:
     return round(ordered[index], 4)
 
 
-def _write_rows_csv(rows: list[dict[str, Any]], path: str | Path) -> None:
+def _write_rows_csv(
+    rows: list[dict[str, Any]],
+    path: str | Path,
+    *,
+    include_usage_columns: bool = True,
+) -> None:
+    usage_columns = {
+        "usage_input_tokens",
+        "usage_cached_tokens",
+        "usage_output_tokens",
+        "usage_source",
+    }
     fieldnames = sorted(
         {key for row in rows for key in row}
-        | {"usage_input_tokens", "usage_cached_tokens", "usage_output_tokens", "usage_source"}
+        | (usage_columns if include_usage_columns else set())
     )
     with Path(path).open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
             flat = dict(row)
-            usage = dict(flat.pop("usage", {}) or {})
-            flat["usage_input_tokens"] = usage.get("input_tokens", "")
-            flat["usage_cached_tokens"] = usage.get("cached_tokens", "")
-            flat["usage_output_tokens"] = usage.get("output_tokens", "")
-            flat["usage_source"] = usage.get("usage_source", "")
+            usage = dict(flat.pop("usage", {}) or {}) if include_usage_columns else {}
+            if include_usage_columns:
+                flat["usage_input_tokens"] = usage.get("input_tokens", "")
+                flat["usage_cached_tokens"] = usage.get("cached_tokens", "")
+                flat["usage_output_tokens"] = usage.get("output_tokens", "")
+                flat["usage_source"] = usage.get("usage_source", "")
             writer.writerow(flat)
 
 

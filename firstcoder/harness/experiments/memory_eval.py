@@ -1,0 +1,1056 @@
+"""P5.1 provider-free memory quality benchmark。
+
+本模块只提供确定性的 fixture、指标和 artifact 适配层，不创建 provider/client、
+不启动实验 runner，也不写入 DurableMemoryStore。``memory_on`` 通过真实的
+``MemoryRetriever(state=...)`` 检查 FirstCoder 的读取 contract；其余变体只是
+用于对比的明确 baseline。fixture 的字段保持稳定，便于后续 P5.2/P5.3 在不
+改变 provider-free 分数含义的前提下接入真实 durable 和 AgentLoop 证据。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import re
+from collections import Counter
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from firstcoder.harness.experiments.context_cost import write_experiment_artifacts
+from firstcoder.memory.models import MemoryQuery
+from firstcoder.memory.retrieval import MemoryRetriever
+
+CHALLENGE_VARIANTS = ("memory_on", "memory_off", "naive_recent", "unsafe_memory")
+MEMORY_METRICS = (
+    "evidence_recall",
+    "evidence_precision",
+    "stale_use",
+    "secret_exposure",
+    "abstention",
+    "false_resume",
+)
+_CASE_CATEGORIES = (
+    "information_extraction",
+    "multi_session_reasoning",
+    "temporal_reasoning",
+    "knowledge_updates",
+    "abstention",
+    "agentic_efficiency",
+)
+_SAFE_REJECT_REASONS = {
+    "below_limit",
+    "global_disabled",
+    "quarantined",
+    "scope_mismatch",
+    "session_mismatch",
+    "stale_evidence",
+    "superseded",
+    "secret_shaped",
+}
+_SAFE_ROW_FIELDS = {
+    "id",
+    "case_id",
+    "variant",
+    "category",
+    "selected_note_ids",
+    "rejected_reasons",
+    "answer_correct",
+    "stale_memory_used",
+    "secret_exposed",
+    "abstained",
+    "false_resume_accepted",
+    "no_evidence",
+    "stale_case",
+    "secret_case",
+    "invalid_resume",
+    "passed",
+    "repeated_reads",
+    "tool_calls",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryFixtureNote:
+    """一个不含外部副作用的 durable-memory 候选。
+
+    ``answer`` 只存在于 fixture 运行时，用来模拟候选被模型采用后的确定性
+    回答；它不会进入 benchmark artifact。``stale_evidence`` 和
+    ``scope_mismatch`` 会映射成 retriever 能识别的拒绝 contract。
+    """
+
+    note_id: str
+    text: str
+    tags: tuple[str, ...] = ()
+    created_at: str = "2026-06-24T10:00:00+00:00"
+    status: str = "active"
+    source: str = ""
+    answer: str = ""
+    stale_evidence: bool = False
+    scope_mismatch: bool = False
+    session_id: str = ""
+
+    def __post_init__(self) -> None:
+        # 接受 list/tuple 两种 fixture 写法，但在对象边界统一为 immutable tuple，
+        # 防止四个变体之间共享 state 时发生隐式修改。
+        object.__setattr__(self, "tags", tuple(str(tag) for tag in self.tags))
+
+    @property
+    def memory_id(self) -> str:
+        """pico fixture 的兼容命名；artifact 统一使用 note_id。"""
+
+        return self.note_id
+
+    def to_state_row(self, note_index: int) -> dict[str, Any]:
+        """把 fixture 转成 FirstCoder retriever 的 working-state 行。"""
+
+        row: dict[str, Any] = {
+            "text": self.text,
+            "tags": list(self.tags),
+            "source": self.source,
+            "created_at": self.created_at,
+            "note_index": note_index,
+            "kind": "episodic",
+            "note_id": self.note_id,
+            "status": self.status,
+        }
+        if self.stale_evidence:
+            row["stale_evidence"] = True
+        if self.scope_mismatch:
+            row["scope_mismatch"] = True
+        if self.session_id:
+            row["evidence"] = {"session_id": self.session_id}
+        return row
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryFixtureCase:
+    """一个可重复执行的 memory contract/challenge 场景。"""
+
+    case_id: str
+    category: str
+    query: str
+    expected_answer: str
+    notes: tuple[MemoryFixtureNote, ...] = ()
+    required_evidence_ids: tuple[str, ...] = ()
+    forbidden_memory_ids: tuple[str, ...] = ()
+    limit: int = 3
+    suite: str = "challenge"
+    no_evidence: bool = False
+    stale_case: bool = False
+    secret_case: bool = False
+    invalid_resume: bool = False
+    efficiency_case: bool = False
+    reject_answer: str = "unknown"
+
+    def __post_init__(self) -> None:
+        # 将外部传入的 list 规范化，确保 fixture 的哈希、排序和重复运行结果稳定。
+        object.__setattr__(self, "notes", tuple(self.notes))
+        object.__setattr__(self, "required_evidence_ids", tuple(self.required_evidence_ids))
+        object.__setattr__(self, "forbidden_memory_ids", tuple(self.forbidden_memory_ids))
+        if self.limit < 0:
+            raise ValueError("fixture case limit must be non-negative")
+
+    @property
+    def id(self) -> str:
+        """兼容 fixture 文档中的短字段名。"""
+
+        return self.case_id
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryObservation:
+    """一次 case/variant 观察，只保存评估所需的布尔和 ID 结果。"""
+
+    case_id: str
+    variant: str
+    selected_note_ids: tuple[str, ...] = ()
+    rejected_reasons: Mapping[str, str] = field(default_factory=dict)
+    answer: str = ""
+    expected_answer: str = ""
+    required_evidence_ids: tuple[str, ...] = ()
+    forbidden_memory_ids: tuple[str, ...] = ()
+    answer_correct: bool = False
+    stale_memory_used: bool = False
+    secret_exposed: bool = False
+    abstained: bool = False
+    false_resume_accepted: bool = False
+    no_evidence: bool = False
+    stale_case: bool = False
+    secret_case: bool = False
+    invalid_resume: bool = False
+    passed: bool = False
+    repeated_reads: int = 0
+    tool_calls: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "selected_note_ids", tuple(self.selected_note_ids))
+        object.__setattr__(self, "required_evidence_ids", tuple(self.required_evidence_ids))
+        object.__setattr__(self, "forbidden_memory_ids", tuple(self.forbidden_memory_ids))
+        object.__setattr__(self, "rejected_reasons", dict(self.rejected_reasons))
+
+    @property
+    def selected_ids(self) -> tuple[str, ...]:
+        """兼容审计调用方的 selected_ids 命名。"""
+
+        return self.selected_note_ids
+
+    def to_artifact_row(self) -> dict[str, Any]:
+        """输出脱敏后的稳定观察行，不包含 query、answer 或 note 原文。"""
+
+        return {
+            "id": self.case_id,
+            "variant": self.variant,
+            "selected_note_ids": list(self.selected_note_ids),
+            "rejected_reasons": dict(self.rejected_reasons),
+            "answer_correct": self.answer_correct,
+            "stale_memory_used": self.stale_memory_used,
+            "secret_exposed": self.secret_exposed,
+            "abstained": self.abstained,
+            "false_resume_accepted": self.false_resume_accepted,
+            "no_evidence": self.no_evidence,
+            "stale_case": self.stale_case,
+            "secret_case": self.secret_case,
+            "invalid_resume": self.invalid_resume,
+            "passed": self.passed,
+            "repeated_reads": self.repeated_reads,
+            "tool_calls": self.tool_calls,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryMetricResult:
+    """单项指标及其分母适用性。
+
+    分母为零时强制输出 ``rate=None`` 与 ``applicable=False``，从数据结构上
+    阻止 benchmark 把没有样本误报成 100% 或 0%。非零分母统一保留四位小数，
+    与现有 harness 报告的确定性数值风格一致。
+    """
+
+    numerator: int
+    denominator: int
+    rate: float | None = None
+    applicable: bool = True
+
+    def __post_init__(self) -> None:
+        if self.numerator < 0 or self.denominator < 0:
+            raise ValueError("metric numerator and denominator must be non-negative")
+        if self.denominator == 0:
+            object.__setattr__(self, "rate", None)
+            object.__setattr__(self, "applicable", False)
+            return
+        object.__setattr__(self, "rate", round(self.numerator / self.denominator, 4))
+        object.__setattr__(self, "applicable", True)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "numerator": self.numerator,
+            "denominator": self.denominator,
+            "rate": self.rate,
+            "applicable": self.applicable,
+        }
+
+
+def _metric(numerator: int, denominator: int) -> MemoryMetricResult:
+    return MemoryMetricResult(numerator=numerator, denominator=denominator)
+
+
+class MemoryEvaluationAdapter:
+    """执行四个 memory 变体的确定性观察器。
+
+    ``memory_on`` 明确调用 FirstCoder retriever；对照变体不复用安全过滤，
+    这样 stale/quarantine/更新场景能真实表现出 baseline 的风险，而不是让
+    对照组意外继承被评估机制本身。
+    """
+
+    def observe(self, case: MemoryFixtureCase, variant: str) -> MemoryObservation:
+        if variant not in CHALLENGE_VARIANTS:
+            raise ValueError(f"unknown memory evaluation variant: {variant}")
+        notes_by_id = {note.note_id: note for note in case.notes}
+        selected_ids: list[str]
+        rejected_reasons: dict[str, str]
+        if variant == "memory_off":
+            selected_ids, rejected_reasons = [], {}
+        elif variant == "memory_on":
+            result = MemoryRetriever(state=_state_for_case(case)).retrieve(
+                MemoryQuery(text=case.query, limit=case.limit)
+            )
+            selected_ids = [note.note_id for note in result.selected_notes]
+            rejected_reasons = {
+                selection.note.note_id: str(selection.reject_reason)
+                for selection in result.selections
+                if not selection.selected and selection.reject_reason
+            }
+        elif variant == "naive_recent":
+            selected_ids = [
+                note.note_id for note in _rank_case_notes(case, include_unsafe=True)[: case.limit]
+            ]
+            rejected_reasons = {}
+        else:
+            # unsafe_memory 模拟只按 retriever 排名、完全不执行 reject contract；
+            # 它与 naive_recent 保持不同实现，以便两个 baseline 的差异可观察。
+            selected_ids = [
+                note.note_id for note in _rank_case_notes(case, include_unsafe=True, preserve_order=True)[: case.limit]
+            ]
+            rejected_reasons = {}
+
+        selected = [notes_by_id[note_id] for note_id in selected_ids if note_id in notes_by_id]
+        selected_set = set(selected_ids)
+        required_set = set(case.required_evidence_ids)
+        forbidden_set = set(case.forbidden_memory_ids)
+        answer = _answer_from_selection(case, selected)
+        answer_correct = answer == case.expected_answer
+        forbidden_selected = bool(selected_set & forbidden_set)
+        required_ok = required_set <= selected_set
+        no_evidence_ok = not case.no_evidence or (answer == "unknown" and not selected)
+        false_resume_accepted = bool(case.invalid_resume and forbidden_selected)
+        passed = answer_correct and required_ok and not forbidden_selected and no_evidence_ok
+        if case.invalid_resume:
+            passed = answer_correct and not false_resume_accepted
+        repeated_reads = int(
+            variant == "memory_off" and (bool(required_set) or case.efficiency_case)
+        )
+        return MemoryObservation(
+            case_id=case.case_id,
+            variant=variant,
+            selected_note_ids=tuple(selected_ids),
+            rejected_reasons=rejected_reasons,
+            answer=answer,
+            expected_answer=case.expected_answer,
+            required_evidence_ids=case.required_evidence_ids,
+            forbidden_memory_ids=case.forbidden_memory_ids,
+            answer_correct=answer_correct,
+            stale_memory_used=bool(case.stale_case and (selected_set & forbidden_set)),
+            secret_exposed=bool(case.secret_case and (selected_set & forbidden_set)),
+            abstained=answer == "unknown",
+            false_resume_accepted=false_resume_accepted,
+            no_evidence=case.no_evidence,
+            stale_case=case.stale_case,
+            secret_case=case.secret_case,
+            invalid_resume=case.invalid_resume,
+            passed=passed,
+            repeated_reads=repeated_reads,
+            tool_calls=repeated_reads,
+        )
+
+
+def evaluate_memory_cases(
+    cases: Iterable[MemoryFixtureCase],
+    adapter: MemoryEvaluationAdapter,
+    mode: str = "challenge",
+) -> dict[str, Any]:
+    """对一组 case 运行四个变体并返回可序列化的确定性结果。
+
+    ``mode`` 只标记 contract/challenge 语义；传入某个 variant 名称时提供一个
+    方便的单变体调试模式，但标准 artifact 始终由四个变体组成。
+    """
+
+    case_list = list(cases)
+    variants = (mode,) if mode in CHALLENGE_VARIANTS else CHALLENGE_VARIANTS
+    evaluated: dict[str, Any] = {}
+    for variant in variants:
+        observations = [adapter.observe(case, variant) for case in case_list]
+        evaluated[variant] = {
+            "summary": _summarize_observations(observations),
+            "metrics": _metric_summary(observations),
+            "rows": [observation.to_artifact_row() for observation in observations],
+        }
+    # 调试单变体仍保留固定键，避免下游 writer/审计代码要猜结果形状。
+    if len(variants) == 1:
+        for variant in CHALLENGE_VARIANTS:
+            evaluated.setdefault(
+                variant,
+                {"summary": _empty_variant_summary(len(case_list)), "metrics": _empty_metrics(), "rows": []},
+            )
+    return {
+        "schema_version": 1,
+        "artifact_type": "memory-eval-v1",
+        "mode": mode,
+        "case_count": len(case_list),
+        "case_categories": dict(sorted(Counter(case.category for case in case_list).items())),
+        "variants": evaluated,
+        "comparisons": _compare_variants(evaluated),
+    }
+
+
+def _metric_summary(observations: list[MemoryObservation]) -> dict[str, dict[str, Any]]:
+    required_total = sum(len(row.required_evidence_ids) for row in observations)
+    required_selected = sum(
+        len(set(row.required_evidence_ids) & set(row.selected_note_ids)) for row in observations
+    )
+    selected_total = sum(len(row.selected_note_ids) for row in observations)
+    stale_cases = sum(row.stale_case for row in observations)
+    secret_cases = sum(row.secret_case for row in observations)
+    abstention_cases = sum(row.no_evidence for row in observations)
+    resume_cases = sum(row.invalid_resume for row in observations)
+    return {
+        "evidence_recall": _metric(required_selected, required_total).to_dict(),
+        "evidence_precision": _metric(required_selected, selected_total).to_dict(),
+        "stale_use": _metric(sum(row.stale_memory_used for row in observations), stale_cases).to_dict(),
+        "secret_exposure": _metric(sum(row.secret_exposed for row in observations), secret_cases).to_dict(),
+        "abstention": _metric(
+            sum(row.no_evidence and row.abstained and not row.selected_note_ids for row in observations),
+            abstention_cases,
+        ).to_dict(),
+        "false_resume": _metric(
+            sum(row.false_resume_accepted for row in observations), resume_cases
+        ).to_dict(),
+    }
+
+
+def _summarize_observations(observations: list[MemoryObservation]) -> dict[str, Any]:
+    metrics = _metric_summary(observations)
+    return {
+        "total_cases": len(observations),
+        "failed": sum(not row.passed for row in observations),
+        "answer_accuracy": _metric(
+            sum(row.answer_correct for row in observations), len(observations)
+        ).rate,
+        "case_pass_rate": _metric(sum(row.passed for row in observations), len(observations)).rate,
+        "avg_repeated_reads": round(
+            sum(row.repeated_reads for row in observations) / len(observations), 4
+        )
+        if observations
+        else 0.0,
+        "avg_tool_calls": round(sum(row.tool_calls for row in observations) / len(observations), 4)
+        if observations
+        else 0.0,
+        "metrics": metrics,
+    }
+
+
+def _empty_variant_summary(case_count: int) -> dict[str, Any]:
+    return {
+        "total_cases": case_count,
+        "failed": 0,
+        "answer_accuracy": None,
+        "case_pass_rate": None,
+        "avg_repeated_reads": 0.0,
+        "avg_tool_calls": 0.0,
+    }
+
+
+def _empty_metrics() -> dict[str, dict[str, Any]]:
+    return {name: _metric(0, 0).to_dict() for name in MEMORY_METRICS}
+
+
+def _compare_variants(variants: Mapping[str, Any]) -> dict[str, dict[str, float | None]]:
+    memory_on = variants.get("memory_on", {})
+    on_metrics = dict(memory_on.get("metrics", {}) or {})
+    comparisons: dict[str, dict[str, float | None]] = {}
+    for baseline in ("memory_off", "naive_recent", "unsafe_memory"):
+        baseline_metrics = dict((variants.get(baseline, {}) or {}).get("metrics", {}) or {})
+        comparisons[f"memory_on_vs_{baseline}"] = {
+            f"{metric}_delta": _rate_delta(on_metrics.get(metric), baseline_metrics.get(metric))
+            for metric in MEMORY_METRICS
+        }
+    return comparisons
+
+
+def _rate_delta(left: Mapping[str, Any] | None, right: Mapping[str, Any] | None) -> float | None:
+    if not left or not right or not left.get("applicable") or not right.get("applicable"):
+        return None
+    return round(float(left["rate"]) - float(right["rate"]), 4)
+
+
+def write_memory_eval_artifacts(payload: Mapping[str, Any], output_dir: str | Path) -> dict[str, str]:
+    """用共享 writer 写出脱敏 JSON/CSV/Markdown memory benchmark artifacts。"""
+
+    safe_payload = _sanitize_memory_payload(payload)
+    flat_rows: list[dict[str, Any]] = []
+    for variant, variant_payload in safe_payload.get("variants", {}).items():
+        for row in variant_payload.get("rows", []):
+            flat = dict(row)
+            flat.setdefault("variant", variant)
+            flat_rows.append(flat)
+    writer_payload = dict(safe_payload)
+    writer_payload["rows"] = flat_rows
+    return write_experiment_artifacts(
+        writer_payload,
+        output_dir,
+        markdown_renderer=render_memory_eval_report,
+        include_usage_columns=False,
+    )
+
+
+def render_memory_eval_report(payload: Mapping[str, Any]) -> str:
+    """渲染短报告，只引用 ID、布尔指标和数值摘要。"""
+
+    lines = [
+        "# Memory Quality Benchmark",
+        "",
+        f"- Mode: {payload.get('mode', 'challenge')}",
+        f"- Cases: {int(payload.get('case_count', 0) or 0)}",
+        "- Provider: none (deterministic fixture)",
+        "",
+        "| Variant | Cases | Pass rate | Evidence recall | Stale use | Secret exposure | Abstention | False resume |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for variant in CHALLENGE_VARIANTS:
+        data = dict((payload.get("variants", {}) or {}).get(variant, {}) or {})
+        summary = dict(data.get("summary", {}) or {})
+        metrics = dict(data.get("metrics", {}) or {})
+        lines.append(
+            "| {variant} | {cases} | {passed} | {recall} | {stale} | {secret} | {abstain} | {resume} |".format(
+                variant=variant,
+                cases=summary.get("total_cases", 0),
+                passed=_display_metric(summary.get("case_pass_rate")),
+                recall=_display_metric((metrics.get("evidence_recall") or {}).get("rate")),
+                stale=_display_metric((metrics.get("stale_use") or {}).get("rate")),
+                secret=_display_metric((metrics.get("secret_exposure") or {}).get("rate")),
+                abstain=_display_metric((metrics.get("abstention") or {}).get("rate")),
+                resume=_display_metric((metrics.get("false_resume") or {}).get("rate")),
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "Contract cases validate mechanism behavior; challenge cases provide the comparative quality signal.",
+            "A metric with no applicable denominator is reported as n/a, never as a passing score.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def render_memory_evaluation_report(payload: Mapping[str, Any]) -> str:
+    """兼容 pico 命名的 renderer 别名，仍由 FirstCoder writer 调用。"""
+
+    return render_memory_eval_report(payload)
+
+
+def build_contract_cases() -> tuple[MemoryFixtureCase, ...]:
+    """构造固定的 8 个机制合同场景。"""
+
+    return (
+        MemoryFixtureCase(
+            "direct_recall_001",
+            "information_extraction",
+            "deploy target",
+            "deploy target is staging",
+            (
+                _note("direct-recall-fact", "deploy target is staging", tags=("deploy",)),
+            ),
+            ("direct-recall-fact",),
+            suite="contract",
+        ),
+        MemoryFixtureCase(
+            "irrelevant_distractor_001",
+            "information_extraction",
+            "deploy key",
+            "deploy key is red",
+            (
+                _note("distractor-blue", "deploy key is blue and unrelated", tags=("deploy",), created_at="2026-06-24T10:00:00+00:00"),
+                _note("distractor-red", "deploy key is red", tags=("deploy",), created_at="2026-06-24T10:01:00+00:00"),
+            ),
+            ("distractor-red",),
+            ("distractor-blue",),
+            limit=1,
+            suite="contract",
+        ),
+        MemoryFixtureCase(
+            "knowledge_update_001",
+            "knowledge_updates",
+            "capital",
+            "capital is Y",
+            (
+                _note("old-capital", "capital is X", tags=("capital",), status="superseded", created_at="2026-06-24T10:02:00+00:00"),
+                _note("new-capital", "capital is Y", tags=("capital",), created_at="2026-06-24T10:01:00+00:00"),
+            ),
+            ("new-capital",),
+            ("old-capital",),
+            limit=3,
+            suite="contract",
+        ),
+        MemoryFixtureCase(
+            "selective_forgetting_001",
+            "temporal_reasoning",
+            "memory policy",
+            "safe memory policy is active",
+            (
+                _note("forgotten-memory", "unsafe memory should be forgotten", tags=("memory",), status="quarantined", created_at="2026-06-24T10:02:00+00:00"),
+                _note("safe-memory", "safe memory policy is active", tags=("memory",), created_at="2026-06-24T10:01:00+00:00"),
+            ),
+            ("safe-memory",),
+            ("forgotten-memory",),
+            suite="contract",
+        ),
+        MemoryFixtureCase(
+            "stale_evidence_001",
+            "temporal_reasoning",
+            "anchor",
+            "unknown",
+            (_note("stale-anchor", "Anchor fact uses alpha.", tags=("anchor",), stale_evidence=True),),
+            forbidden_memory_ids=("stale-anchor",),
+            stale_case=True,
+            suite="contract",
+        ),
+        MemoryFixtureCase(
+            "secret_safety_001",
+            "agentic_efficiency",
+            "config",
+            "unknown",
+            (_note("secret-openai", "api key sk-AAAAAAAAAAAAAAAAAAAA for service X", tags=("config",), status="quarantined"),),
+            forbidden_memory_ids=("secret-openai",),
+            secret_case=True,
+            suite="contract",
+        ),
+        MemoryFixtureCase(
+            "no_evidence_abstention_001",
+            "abstention",
+            "payment provider",
+            "unknown",
+            (_note("unrelated-build", "build tool is uv", tags=("build",)),),
+            no_evidence=True,
+            suite="contract",
+        ),
+        MemoryFixtureCase(
+            "multi_session_reasoning_001",
+            "multi_session_reasoning",
+            "session benchmark report",
+            "benchmark target is memory; report format is markdown",
+            (
+                _note("session-one-memory-target", "session one decided the benchmark target is memory", tags=("session", "benchmark"), source="session-1"),
+                _note("session-two-report-format", "session two decided the report format is markdown", tags=("session", "report"), source="session-2"),
+            ),
+            ("session-one-memory-target", "session-two-report-format"),
+            suite="contract",
+        ),
+    )
+
+
+def build_challenge_cases() -> tuple[MemoryFixtureCase, ...]:
+    """构造固定的 54 个 challenge case，覆盖六类能力。
+
+    这些 case 保留了原始 fixture 的语义结构：更新冲突包含 superseded 旧值，
+    temporal case 包含 stale/scope 拒绝，abstention case 没有支持证据，
+    multi-session case 需要组合两个事实，效率 case 观察 memory-off 的重复读取。
+    """
+
+    cases: list[MemoryFixtureCase] = []
+    cases.extend(_build_information_cases(12))
+    cases.extend(_build_multi_session_cases(10))
+    cases.extend(_build_temporal_cases(10))
+    cases.extend(_build_update_cases(10))
+    cases.extend(_build_abstention_cases(6))
+    cases.extend(_build_efficiency_cases(6))
+    return tuple(cases)
+
+
+def build_memory_fixture_cases(mode: str = "challenge") -> tuple[MemoryFixtureCase, ...]:
+    """按 suite 名称返回固定 fixture；未知模式 fail-closed。"""
+
+    if mode == "contract":
+        return build_contract_cases()
+    if mode == "challenge":
+        return build_challenge_cases()
+    raise ValueError("memory fixture mode must be contract or challenge")
+
+
+# 两组别名便于外部 runner 使用更接近文档的命名，不复制 fixture 数据。
+contract_fixture_cases = build_contract_cases
+challenge_fixture_cases = build_challenge_cases
+
+
+def _note(
+    note_id: str,
+    text: str,
+    *,
+    tags: tuple[str, ...] = (),
+    created_at: str = "2026-06-24T10:00:00+00:00",
+    status: str = "active",
+    source: str = "",
+    answer: str = "",
+    stale_evidence: bool = False,
+    scope_mismatch: bool = False,
+) -> MemoryFixtureNote:
+    return MemoryFixtureNote(
+        note_id=note_id,
+        text=text,
+        tags=tags,
+        created_at=created_at,
+        status=status,
+        source=source,
+        answer=answer or text,
+        stale_evidence=stale_evidence,
+        scope_mismatch=scope_mismatch,
+    )
+
+
+def _build_information_cases(count: int) -> list[MemoryFixtureCase]:
+    cases = []
+    for index in range(count):
+        new_id = f"info-current-{index:02d}"
+        old_id = f"info-old-{index:02d}"
+        answer = f"uv run pytest case-{index:02d}"
+        # 第一个 challenge 有意让“按最近时间”与“按原始顺序”分歧，
+        # 证明 naive_recent 和 unsafe_memory 是两个可观察的 baseline。
+        old_created_at = (
+            "2026-06-24T10:00:00+00:00"
+            if index == 0
+            else "2026-06-24T10:02:00+00:00"
+        )
+        cases.append(
+            MemoryFixtureCase(
+                f"info_extract_{index:03d}",
+                "information_extraction",
+                f"project test command {index:02d}",
+                answer,
+                (
+                    _note(old_id, f"Project test command {index:02d} is pytest legacy.", tags=("project", "test", "command"), status="superseded", created_at=old_created_at, answer="pytest legacy"),
+                    _note(new_id, f"Project test command {index:02d} is {answer}.", tags=("project", "test", "command"), created_at="2026-06-24T10:01:00+00:00", answer=answer),
+                ),
+                (new_id,),
+                (old_id,),
+                limit=1,
+            )
+        )
+    return cases
+
+
+def _build_multi_session_cases(count: int) -> list[MemoryFixtureCase]:
+    cases = []
+    for index in range(count):
+        first_id = f"multi-first-{index:02d}"
+        second_id = f"multi-second-{index:02d}"
+        first = f"session one recorded benchmark target {index:02d}"
+        second = f"session two recorded report format markdown {index:02d}"
+        cases.append(
+            MemoryFixtureCase(
+                f"multi_session_{index:03d}",
+                "multi_session_reasoning",
+                f"benchmark target report format {index:02d}",
+                f"benchmark target {index:02d}; report format markdown",
+                (
+                    _note(first_id, first, tags=("benchmark", "target"), source="session-a", answer=f"benchmark target {index:02d}"),
+                    _note(second_id, second, tags=("report", "format"), source="session-b", answer="report format markdown"),
+                ),
+                (first_id, second_id),
+                limit=3,
+            )
+        )
+    return cases
+
+
+def _build_temporal_cases(count: int) -> list[MemoryFixtureCase]:
+    cases = []
+    for index in range(count):
+        note_id = f"temporal-invalid-{index:02d}"
+        is_scope = index % 2 == 1
+        text = (
+            f"workspace checkpoint {index:02d} is valid after drift"
+            if is_scope
+            else f"current release command {index:02d} is make test"
+        )
+        cases.append(
+            MemoryFixtureCase(
+                f"temporal_rejection_{index:03d}",
+                "temporal_reasoning",
+                f"{('workspace checkpoint' if is_scope else 'current release command')} {index:02d}",
+                "No." if is_scope else "unknown",
+                (
+                    _note(
+                        note_id,
+                        text,
+                        tags=("checkpoint", "release", "current"),
+                        stale_evidence=not is_scope,
+                        scope_mismatch=is_scope,
+                        answer="Yes.",
+                    ),
+                ),
+                forbidden_memory_ids=(note_id,),
+                stale_case=not is_scope,
+                invalid_resume=is_scope,
+                reject_answer="No." if is_scope else "unknown",
+            )
+        )
+    return cases
+
+
+def _build_update_cases(count: int) -> list[MemoryFixtureCase]:
+    cases = []
+    for index in range(count):
+        old_id = f"update-old-{index:02d}"
+        new_id = f"update-new-{index:02d}"
+        answer = f"policy revision {index:02d} is active"
+        cases.append(
+            MemoryFixtureCase(
+                f"knowledge_update_{index:03d}",
+                "knowledge_updates",
+                f"policy revision {index:02d}",
+                answer,
+                (
+                    _note(old_id, f"policy revision {index:02d} is retired", tags=("policy", "revision"), status="superseded", created_at="2026-06-24T10:04:00+00:00", answer="retired"),
+                    _note(new_id, answer, tags=("policy", "revision"), created_at="2026-06-24T10:01:00+00:00", answer=answer),
+                ),
+                (new_id,),
+                (old_id,),
+                limit=1,
+            )
+        )
+    return cases
+
+
+def _build_abstention_cases(count: int) -> list[MemoryFixtureCase]:
+    cases = []
+    for index in range(count):
+        note_id = f"abstention-unrelated-{index:02d}"
+        if index < 2:
+            # near-miss：候选与 query 有词法重叠，但被安全 retriever 拒绝；
+            # naive/unsafe baseline 会把它当答案，令 abstention 指标有区分度。
+            query = f"production incident status case-{index:02d}"
+            note = _note(
+                note_id,
+                "production incident handler is open",
+                tags=("production", "incident"),
+                status="quarantined",
+                answer="handler is open",
+            )
+            forbidden_ids = (note_id,)
+        else:
+            query = f"unknown production incident case-{index:02d}"
+            note = _note(note_id, "build tool for this project is uv", tags=("build",))
+            forbidden_ids = ()
+        cases.append(
+            MemoryFixtureCase(
+                f"abstention_{index:03d}",
+                "abstention",
+                query,
+                "unknown",
+                (note,),
+                forbidden_memory_ids=forbidden_ids,
+                no_evidence=True,
+            )
+        )
+    return cases
+
+
+def _build_efficiency_cases(count: int) -> list[MemoryFixtureCase]:
+    cases = []
+    for index in range(count):
+        if index < 3:
+            note_id = f"efficiency-known-file-{index:02d}"
+            text = f"already inspected tests/memory_case_{index:02d}.py for benchmark coverage"
+            query = f"which test file was inspected {index:02d}"
+            answer = f"tests/memory_case_{index:02d}.py"
+            note = _note(note_id, text, tags=("test", "file"), answer=answer)
+            kwargs: dict[str, Any] = {}
+        else:
+            note_id = f"efficiency-secret-{index:02d}"
+            note = _note(note_id, "service api key sk-AAAAAAAAAAAAAAAAAAAA is stored", tags=("config", "secret"), status="quarantined", answer="sk-AAAAAAAAAAAAAAAAAAAA")
+            query = f"which service config secret {index:02d}"
+            answer = "unknown"
+            kwargs = {"secret_case": True}
+        cases.append(
+            MemoryFixtureCase(
+                f"agentic_efficiency_{index:03d}",
+                "agentic_efficiency",
+                query,
+                answer,
+                (note,),
+                required_evidence_ids=(note_id,) if not kwargs.get("secret_case") else (),
+                forbidden_memory_ids=(note_id,) if kwargs.get("secret_case") else (),
+                efficiency_case=True,
+                **kwargs,
+            )
+        )
+    return cases
+
+
+def _state_for_case(case: MemoryFixtureCase) -> dict[str, Any]:
+    return {
+        "working": {"task_summary": "", "recent_files": []},
+        "episodic_notes": [note.to_state_row(index) for index, note in enumerate(case.notes)],
+        "file_summaries": {},
+        "next_note_index": len(case.notes),
+    }
+
+
+def _fixture_tokens(text: str) -> set[str]:
+    return {token.lower() for token in re.findall(r"[A-Za-z0-9_/-]+", str(text))}
+
+
+def _rank_case_notes(
+    case: MemoryFixtureCase,
+    *,
+    include_unsafe: bool,
+    preserve_order: bool = False,
+) -> list[MemoryFixtureNote]:
+    query_tokens = _fixture_tokens(case.query)
+    candidates: list[tuple[int, str, int, MemoryFixtureNote]] = []
+    for index, note in enumerate(case.notes):
+        if not include_unsafe and note.status in {"superseded", "quarantined"}:
+            continue
+        if not include_unsafe and (note.stale_evidence or note.scope_mismatch):
+            continue
+        note_tokens = _fixture_tokens(note.text) | {tag.lower() for tag in note.tags}
+        overlap = len(query_tokens & note_tokens)
+        if overlap:
+            candidates.append((overlap, note.created_at, index, note))
+    if preserve_order:
+        candidates.sort(key=lambda item: item[2])
+    else:
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return [item[3] for item in candidates]
+
+
+def _answer_from_selection(case: MemoryFixtureCase, selected: list[MemoryFixtureNote]) -> str:
+    selected_ids = {note.note_id for note in selected}
+    forbidden = set(case.forbidden_memory_ids)
+    required = set(case.required_evidence_ids)
+    if case.no_evidence:
+        return "unknown" if not selected else (selected[0].answer or selected[0].text)
+    if not selected:
+        return case.reject_answer
+    if selected_ids & forbidden:
+        selected_forbidden = next(note for note in selected if note.note_id in forbidden)
+        return selected_forbidden.answer or selected_forbidden.text
+    if required and required <= selected_ids:
+        return case.expected_answer
+    return selected[0].answer or selected[0].text
+
+
+def _display_metric(value: object) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value):.2%}"
+
+
+def _safe_identifier(value: object) -> str:
+    text = str(value or "")
+    if re.fullmatch(r"[A-Za-z0-9_.:-]+", text):
+        return text
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _safe_metric(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return _metric(0, 0).to_dict()
+    denominator = _safe_int(value.get("denominator", 0))
+    numerator = _safe_int(value.get("numerator", 0))
+    return _metric(numerator, denominator).to_dict()
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    """只接受有限数值，避免把任意文本重新写入结构化 artifact。"""
+
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return int(value)
+    return default
+
+
+def _safe_number(value: object) -> float | int | None:
+    """保留报告需要的有限数值；secret/prompt 等字符串一律丢弃。"""
+
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
+
+
+def _safe_row(row: Mapping[str, Any], variant: str) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for field_name in _SAFE_ROW_FIELDS:
+        if field_name not in row:
+            continue
+        value = row[field_name]
+        if field_name in {"id", "case_id", "variant", "category"}:
+            safe[field_name] = _safe_identifier(value)
+        elif field_name == "selected_note_ids":
+            safe[field_name] = [_safe_identifier(item) for item in value if str(item)]
+        elif field_name == "rejected_reasons":
+            safe[field_name] = {
+                _safe_identifier(note_id): str(reason)
+                for note_id, reason in dict(value or {}).items()
+                if str(reason) in _SAFE_REJECT_REASONS
+            }
+        elif field_name in {
+            "answer_correct",
+            "stale_memory_used",
+            "secret_exposed",
+            "abstained",
+            "false_resume_accepted",
+            "no_evidence",
+            "stale_case",
+            "secret_case",
+            "invalid_resume",
+            "passed",
+        }:
+            safe[field_name] = bool(value)
+        elif field_name in {"repeated_reads", "tool_calls"}:
+            safe[field_name] = _safe_int(value)
+    return safe
+
+
+def _sanitize_memory_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """从任意 evaluator payload 中只提取稳定字段，作为最后一道脱敏边界。"""
+
+    safe: dict[str, Any] = {
+        "schema_version": _safe_int(payload.get("schema_version", 1), default=1),
+        "artifact_type": "memory-eval-v1",
+        "mode": _safe_identifier(payload.get("mode", "challenge")),
+        "case_count": _safe_int(payload.get("case_count", 0)),
+        "case_categories": {
+            _safe_identifier(category): int(count or 0)
+            for category, count in dict(payload.get("case_categories", {}) or {}).items()
+            if str(category) in _CASE_CATEGORIES
+        },
+        "variants": {},
+    }
+    for variant in CHALLENGE_VARIANTS:
+        raw_variant = dict((payload.get("variants", {}) or {}).get(variant, {}) or {})
+        raw_metrics = dict(raw_variant.get("metrics", {}) or {})
+        metrics = {metric: _safe_metric(raw_metrics.get(metric)) for metric in MEMORY_METRICS}
+        rows = [
+            _safe_row(row, variant)
+            for row in (raw_variant.get("rows", []) or [])
+            if isinstance(row, Mapping)
+        ]
+        raw_summary = dict(raw_variant.get("summary", {}) or {})
+        summary = {
+            "total_cases": _safe_int(raw_summary.get("total_cases", len(rows)), default=len(rows)),
+            "failed": _safe_int(raw_summary.get("failed", 0)),
+            "answer_accuracy": _safe_number(raw_summary.get("answer_accuracy")),
+            "case_pass_rate": _safe_number(raw_summary.get("case_pass_rate")),
+            "avg_repeated_reads": _safe_number(raw_summary.get("avg_repeated_reads", 0.0)) or 0.0,
+            "avg_tool_calls": _safe_number(raw_summary.get("avg_tool_calls", 0.0)) or 0.0,
+        }
+        safe["variants"][variant] = {"summary": summary, "metrics": metrics, "rows": rows}
+    safe["comparisons"] = {
+        key: {
+            metric: value
+            for metric, value in dict(comparison or {}).items()
+            if metric in {f"{name}_delta" for name in MEMORY_METRICS}
+            and (value is None or isinstance(value, (int, float)))
+        }
+        for key, comparison in dict(payload.get("comparisons", {}) or {}).items()
+        if key in {f"memory_on_vs_{variant}" for variant in CHALLENGE_VARIANTS if variant != "memory_on"}
+    }
+    return safe
+
+
+__all__ = [
+    "CHALLENGE_VARIANTS",
+    "MEMORY_METRICS",
+    "MemoryEvaluationAdapter",
+    "MemoryFixtureCase",
+    "MemoryFixtureNote",
+    "MemoryMetricResult",
+    "MemoryObservation",
+    "build_challenge_cases",
+    "build_contract_cases",
+    "build_memory_fixture_cases",
+    "challenge_fixture_cases",
+    "contract_fixture_cases",
+    "evaluate_memory_cases",
+    "render_memory_eval_report",
+    "render_memory_evaluation_report",
+    "write_memory_eval_artifacts",
+]
