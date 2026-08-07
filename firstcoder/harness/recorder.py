@@ -312,6 +312,11 @@ class RunRecorder:
         self._emit(
             "model_parsed",
             {
+                # 失败请求也必须带与成功请求相同的顶层关联键。provider_call
+                # 嵌套对象适合保留完整事实，但 benchmark/evaluator 的公共事件
+                # 契约应能在不展开 provider-specific payload 时完成 request 关联。
+                "request_id": metadata.call_id,
+                "projection_fingerprint": metadata.projection_fingerprint,
                 "provider_call": metadata.to_dict(),
                 "provider_call_metadata": metadata.to_dict(),
                 "completion_metadata": completion,

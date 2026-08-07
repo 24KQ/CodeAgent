@@ -493,6 +493,9 @@ class AgentSession:
                     note_id: reason for note_id, reason in projection.rejected_reasons
                 },
                 "include_global": bool(projection.include_global),
+                # 空 projection 仍可能是一次有效的无命中检索；把它显式标出，
+                # 评估器可以把 abstention 与“没有执行检索”区分开。
+                "projection_empty": not bool(projection.text),
                 "selected_count": len(projection.selected_note_ids),
             }
         )

@@ -11,11 +11,13 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 from firstcoder.agent.loop import AgentLoop
 from firstcoder.agent.session import AgentSession
 from firstcoder.context.store import JsonlSessionStore
 from firstcoder.harness.experiments.memory_eval import correlate_memory_audit_events
+from firstcoder.harness.recorder import RunRecorder
 from firstcoder.memory.durable import DurableMemoryStore
 from firstcoder.providers.base import ChatProvider
 from firstcoder.providers.types import (
@@ -128,6 +130,104 @@ def test_context_budget_probe_does_not_write_memory_audit(tmp_path: Path) -> Non
     loop.context_budget_for_view(session.rebuild_view())
 
     assert [event for event in session.store.list_events(session.session_id) if event.type == "memory_retrieved"] == []
+
+
+def test_empty_memory_query_does_not_write_retrieval_audit(tmp_path: Path) -> None:
+    """没有可检索 query 时，真实 provider 请求不能伪造 memory_retrieved。"""
+
+    session = _session(tmp_path, session_id="empty-query")
+    provider = _FixtureProvider(
+        [
+            ChatResponse(
+                provider="fixture",
+                model="fixture-model",
+                content="done",
+                finish_reason="stop",
+            )
+        ]
+    )
+
+    result = AgentLoop(session=session, provider=provider)._run_user_turn_sync("   ")
+
+    assert result.response is not None
+    assert [
+        event
+        for event in session.store.list_events(session.session_id)
+        if event.type == "memory_retrieved"
+    ] == []
+
+
+def test_empty_memory_projection_records_abstention_audit_for_real_query(tmp_path: Path) -> None:
+    """有 query 但无命中时，空 projection 仍要保留 abstention 证据。"""
+
+    session = _session(tmp_path, session_id="empty-projection")
+    provider = _FixtureProvider(
+        [
+            ChatResponse(
+                provider="fixture",
+                model="fixture-model",
+                content="done",
+                finish_reason="stop",
+            )
+        ]
+    )
+
+    result = AgentLoop(session=session, provider=provider)._run_user_turn_sync(
+        "no durable memory matches this query"
+    )
+
+    assert result.response is not None
+    events = [
+        event
+        for event in session.store.list_events(session.session_id)
+        if event.type == "memory_retrieved"
+    ]
+    assert len(events) == 1
+    assert events[0].payload["projection_empty"] is True
+    assert events[0].payload["query_hash"]
+    assert events[0].payload["selected_note_ids"] == []
+    payload = events[0].payload
+    evaluated = correlate_memory_audit_events(
+        [
+            {"type": "memory_retrieved", "payload": payload},
+            {
+                "event": "prompt_built",
+                "request_id": payload["request_id"],
+                "projection_fingerprint": payload["projection_fingerprint"],
+            },
+            {
+                "event": "model_requested",
+                "request_id": payload["request_id"],
+                "projection_fingerprint": payload["projection_fingerprint"],
+            },
+        ]
+    )
+    assert evaluated["associations"][0]["projection_empty"] is True
+
+
+def test_provider_error_trace_keeps_request_correlation_keys(tmp_path: Path) -> None:
+    """provider 失败的 model_parsed 也必须暴露统一的顶层关联键。"""
+
+    session = _session(tmp_path, session_id="provider-error")
+    provider = _FixtureProvider([])
+    loop = AgentLoop(session=session, provider=provider)
+    budget = loop.context_budget_for_view(session.rebuild_view())
+    prepared = SimpleNamespace(
+        request_id="request-error",
+        projection_fingerprint="fingerprint-error",
+        context_budget=budget,
+    )
+    recorder = RunRecorder(session=session, user_request="provider failure")
+
+    recorder.record_provider_requested(prepared, provider)
+    recorder.record_provider_error(prepared, provider, RuntimeError("fixture failure"))
+
+    assert recorder.run_store is not None
+    trace_path = recorder.run_store.trace_path(recorder.task_state)
+    trace_events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    parsed = next(event for event in trace_events if event["event"] == "model_parsed")
+    assert parsed["request_id"] == "request-error"
+    assert parsed["projection_fingerprint"] == "fingerprint-error"
 
 
 def test_agent_loop_links_each_memory_audit_to_two_provider_requests(tmp_path: Path) -> None:
@@ -249,3 +349,66 @@ def test_memory_audit_evaluator_marks_legacy_events_as_fallback() -> None:
     assert result["claimable"] is False
     assert result["associations"][0]["confidence"] == "high"
     assert result["associations"][1]["confidence"] == "fallback"
+
+
+def test_memory_audit_evaluator_rejects_duplicate_request_pairs() -> None:
+    """同一二元键重复出现时，逐行结果也不能继续声称 high。"""
+
+    events = [
+        {
+            "type": "memory_retrieved",
+            "payload": {
+                "request_id": "duplicate-request",
+                "projection_fingerprint": "duplicate-fingerprint",
+                "selected_note_ids": ["note-a"],
+            },
+        },
+        {
+            "type": "memory_retrieved",
+            "payload": {
+                "request_id": "duplicate-request",
+                "projection_fingerprint": "duplicate-fingerprint",
+                "selected_note_ids": ["note-b"],
+            },
+        },
+        {
+            "event": "prompt_built",
+            "request_id": "duplicate-request",
+            "projection_fingerprint": "duplicate-fingerprint",
+        },
+        {
+            "event": "model_requested",
+            "request_id": "duplicate-request",
+            "projection_fingerprint": "duplicate-fingerprint",
+        },
+        {
+            "type": "memory_retrieved",
+            "payload": {
+                "request_id": "unique-request",
+                "projection_fingerprint": "unique-fingerprint",
+                "selected_note_ids": ["note-unique"],
+            },
+        },
+        {
+            "event": "prompt_built",
+            "request_id": "unique-request",
+            "projection_fingerprint": "unique-fingerprint",
+        },
+        {
+            "event": "model_requested",
+            "request_id": "unique-request",
+            "projection_fingerprint": "unique-fingerprint",
+        },
+    ]
+
+    result = correlate_memory_audit_events(events)
+
+    assert result["duplicate_key_count"] == 1
+    assert result["duplicate_count"] == 2
+    assert result["high_confidence_count"] == 1
+    assert result["claimable"] is False
+    assert [row["confidence"] for row in result["associations"]] == [
+        "duplicate",
+        "duplicate",
+        "high",
+    ]

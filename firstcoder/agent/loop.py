@@ -1228,7 +1228,10 @@ class AgentLoop:
             # 生成后统一补齐 request/fingerprint，命令侧的旧 callback 仍保持兼容。
             record_audit=False,
         )
-        if record_memory_event:
+        if record_memory_event and memory_projection.query_hash:
+            # 只有非空 query 才真正执行过 MemoryRetriever。没有 query 时返回的
+            # 空 projection 只是“本轮无需检索”，不能伪造 memory_retrieved；但
+            # 有 query 而无 selected note 仍需保留 audit，供 abstention 指标使用。
             self._pending_memory_projection = memory_projection
         if memory_message is not None:
             system_prefix = [*system_prefix, memory_message]
