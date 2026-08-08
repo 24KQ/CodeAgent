@@ -24,6 +24,7 @@ def test_help_command_lists_current_slash_commands() -> None:
         "/compact": "Compact context now.",
         "/remember <text> [--promote <topic>] [--global]": "Capture or promote memory.",
         "/memory [--global] [query]": "Show or search visible memory.",
+        "/dream": "Consolidate workspace memory now.",
         "/mode": "Show permission mode.",
         "/mode <standard|aggressive|bypass>": "Change permission mode.",
     }

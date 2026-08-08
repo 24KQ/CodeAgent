@@ -4,7 +4,12 @@ import time
 
 import pytest
 
-from firstcoder.app.runtime import AgentChatRunner, CurrentSessionState, _display_lines_from_messages
+from firstcoder.app.runtime import (
+    AgentChatRunner,
+    CurrentSessionState,
+    _display_lines_from_messages,
+    _is_successful_maintenance_turn,
+)
 from firstcoder.agent.loop import ToolExecutionEvent
 from firstcoder.agent.loop_limits import AgentLoopLimits
 from firstcoder.agent.session import AgentSession
@@ -63,6 +68,16 @@ class FakeStreamingProvider(ChatProvider):
         if response.content:
             yield ChatStreamEvent(kind="text_delta", text=response.content)
         yield ChatStreamEvent(kind="message_completed", response=response)
+
+
+class FakeMemoryScheduler:
+    """只记录触发，不创建线程，验证 AgentChatRunner 的接入边界。"""
+
+    def __init__(self) -> None:
+        self.session_ids: list[str] = []
+
+    def maybe_schedule(self, session_id: str):
+        self.session_ids.append(session_id)
 
 
 @dataclass
@@ -152,6 +167,37 @@ def test_agent_chat_runner_uses_current_session_and_can_follow_resume(tmp_path) 
     ]
 
 
+def test_agent_chat_runner_triggers_memory_scheduler_after_completed_turn(tmp_path) -> None:
+    """最终 assistant 已落库后才触发 scheduler，并使用当前 session id。"""
+
+    store = JsonlSessionStore(tmp_path)
+    session = AgentSession.create(store=store, session_id="sess_dream_trigger", agents_md="")
+    scheduler = FakeMemoryScheduler()
+    runner = AgentChatRunner(
+        current_session=CurrentSessionState(session),
+        provider=FakeProvider([ChatResponse(provider="fake", model="fake-model", content="完成")]),
+        memory_scheduler=scheduler,
+    )
+
+    assert runner.run_user_turn("触发维护").content == "完成"
+
+    assert scheduler.session_ids == ["sess_dream_trigger"]
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "content_filter", "unknown"])
+def test_truncated_or_filtered_final_response_does_not_trigger_memory_maintenance(finish_reason: str) -> None:
+    """残缺/过滤/未知终止原因不能被当作可整理的最终回答。"""
+
+    response = ChatResponse(
+        provider="fake",
+        model="fake-model",
+        content="partial",
+        finish_reason=finish_reason,
+    )
+
+    assert _is_successful_maintenance_turn(response) is False
+
+
 def test_agent_chat_runner_cancel_current_turn_interrupts_running_python_exec(tmp_path) -> None:
     store = JsonlSessionStore(tmp_path / ".firstcoder")
     python_tool = create_python_exec_tool(tmp_path)
@@ -181,7 +227,13 @@ def test_agent_chat_runner_cancel_current_turn_interrupts_running_python_exec(tm
             ChatResponse(provider="fake", model="fake-model", content="should not continue"),
         ]
     )
-    runner = AgentChatRunner(current_session=state, provider=provider, tools=[python_tool])
+    scheduler = FakeMemoryScheduler()
+    runner = AgentChatRunner(
+        current_session=state,
+        provider=provider,
+        tools=[python_tool],
+        memory_scheduler=scheduler,
+    )
 
     async def run_and_cancel():
         task = asyncio.create_task(runner.arun_user_turn("run slow shell"))
@@ -197,6 +249,7 @@ def test_agent_chat_runner_cancel_current_turn_interrupts_running_python_exec(tm
     assert response.content == "当前任务已中断。"
     assert elapsed_after_cancel < 2
     assert len(provider.requests) == 1
+    assert scheduler.session_ids == []
 
 
 def test_agent_chat_runner_drains_pending_guidance_once(tmp_path) -> None:
@@ -371,7 +424,8 @@ def test_agent_chat_runner_exposes_pending_user_input(tmp_path) -> None:
             )
         ]
     )
-    runner = AgentChatRunner(current_session=state, provider=provider)
+    scheduler = FakeMemoryScheduler()
+    runner = AgentChatRunner(current_session=state, provider=provider, memory_scheduler=scheduler)
 
     response = runner.run_user_turn("先问我")
 
@@ -387,6 +441,7 @@ def test_agent_chat_runner_exposes_pending_user_input(tmp_path) -> None:
         "继续吗？",
     ]
     assert runner._active_cancellation_token is None
+    assert scheduler.session_ids == []
 
 
 def test_agent_chat_runner_can_resume_permission_confirmation(tmp_path) -> None:

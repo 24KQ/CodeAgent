@@ -7,10 +7,11 @@ from firstcoder.config.models import (
     ModelRequestOptions,
     ProviderProfile,
 )
-from firstcoder.config.settings import AppConfig, load_config
+from firstcoder.config.settings import AppConfig, MemoryConfig, load_config
 
 __all__ = [
     "AppConfig",
+    "MemoryConfig",
     "load_config",
     "ModelCatalog",
     "ModelCatalogError",

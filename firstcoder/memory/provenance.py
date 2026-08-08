@@ -109,7 +109,16 @@ def source_path_for_evidence(workspace_root: str | Path | None, source_path: str
         return resolved
     if workspace_root is None:
         return path
-    return Path(workspace_root) / path
+    root = Path(workspace_root).resolve()
+    resolved = (root / path).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        # 相对路径同样可能通过 ``..`` 或 workspace 内的链接逃逸；返回 None
+        # 让写入边界和读取 freshness 统一拒绝，而不是把未规范化路径交给后续
+        # compute_anchor_hash 读取。
+        return None
+    return resolved
 
 
 def apply_evidence_staleness(

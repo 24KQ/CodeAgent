@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from copy import deepcopy
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Any
 import tomllib
@@ -18,6 +19,38 @@ from dotenv import load_dotenv
 from firstcoder.config.models import ModelCatalog, build_model_catalog
 
 PROJECT_CONFIG_NAME = "firstcoder.toml"
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryConfig:
+    """P6 memory 配置的类型化边界。
+
+    自动 dream 默认关闭是一个安全默认值：即使用户已有旧配置，也不会因为
+    升级 FirstCoder 而突然产生 provider 调用或 durable memory 写入。数值字段
+    在配置加载时校验，避免 scheduler 收到 ``str``、负数或 NaN 后才在后台线程
+    中失败，导致用户只能从状态文件猜测原因。
+    """
+
+    auto_dream: bool = False
+    dream_interval_hours: float = 24.0
+    dream_min_sessions: int = 3
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.auto_dream, bool):
+            raise ValueError("[memory].auto_dream must be a boolean")
+        if (
+            isinstance(self.dream_interval_hours, bool)
+            or not isinstance(self.dream_interval_hours, (int, float))
+            or not math.isfinite(float(self.dream_interval_hours))
+            or float(self.dream_interval_hours) < 0
+        ):
+            raise ValueError("[memory].dream_interval_hours must be a finite non-negative number")
+        if (
+            isinstance(self.dream_min_sessions, bool)
+            or not isinstance(self.dream_min_sessions, int)
+            or self.dream_min_sessions <= 0
+        ):
+            raise ValueError("[memory].dream_min_sessions must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +116,26 @@ class AppConfig:
             for name, server_config in raw_mcp.items():
                 merged[name] = deepcopy(server_config)
         return merged
+
+    def memory_config(self) -> MemoryConfig:
+        """返回按项目优先、全局回退合并后的 memory 配置。
+
+        只合并 P6 公开字段；未知字段仍保留在 TOML 原始配置中供未来版本使用，
+        但当前版本不会把它们悄悄传给 scheduler，避免配置拼写错误改变运行行为。
+        ``[memory]`` 若不是表则立即报错，而不是把错误延迟到一次后台维护任务。
+        """
+
+        values: dict[str, Any] = {}
+        for config in (self.global_config, self.project_config):
+            if not config or "memory" not in config:
+                continue
+            section = config["memory"]
+            if not isinstance(section, dict):
+                raise ValueError("[memory] 配置必须是表")
+            for name in ("auto_dream", "dream_interval_hours", "dream_min_sessions"):
+                if name in section:
+                    values[name] = section[name]
+        return MemoryConfig(**values)
 
     def model_catalog(self) -> ModelCatalog:
         """返回合并后的多模型目录。"""
@@ -177,6 +230,11 @@ def render_default_config() -> str:
             "",
             "[ui]",
             'theme = "default"',
+            "",
+            "[memory]",
+            "auto_dream = false",
+            "dream_interval_hours = 24",
+            "dream_min_sessions = 3",
             "",
         ]
     )

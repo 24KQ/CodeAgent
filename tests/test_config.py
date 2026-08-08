@@ -48,6 +48,53 @@ def test_load_config_reads_project_firstcoder_toml(tmp_path, monkeypatch):
     assert config.project_config_path == tmp_path / "firstcoder.toml"
 
 
+def test_memory_config_uses_safe_defaults_and_project_overrides() -> None:
+    """P6 自动维护默认关闭，项目配置可以覆盖全局配置的三个公开字段。"""
+
+    config = AppConfig(
+        env={},
+        global_config={
+            "memory": {
+                "auto_dream": True,
+                "dream_interval_hours": 12,
+                "dream_min_sessions": 4,
+            }
+        },
+        project_config={"memory": {"auto_dream": False, "dream_min_sessions": 5}},
+    )
+
+    assert config.memory_config().auto_dream is False
+    assert config.memory_config().dream_interval_hours == 12.0
+    assert config.memory_config().dream_min_sessions == 5
+
+
+def test_memory_config_defaults_to_disabled() -> None:
+    """没有新配置时升级不能隐式启用 provider-free 之外的 dream 调度。"""
+
+    memory = AppConfig(env={}).memory_config()
+
+    assert memory.auto_dream is False
+    assert memory.dream_interval_hours == 24.0
+    assert memory.dream_min_sessions == 3
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        {"auto_dream": "false"},
+        {"dream_interval_hours": -1},
+        {"dream_interval_hours": float("nan")},
+        {"dream_min_sessions": 0},
+        {"dream_min_sessions": True},
+    ],
+)
+def test_memory_config_rejects_invalid_values(section) -> None:
+    """非法配置在启动时失败关闭，而不是由后台线程吞掉。"""
+
+    with pytest.raises(ValueError, match=r"\[memory\]"):
+        AppConfig(env={}, project_config={"memory": section}).memory_config()
+
+
 def test_legacy_environment_provider_does_not_override_catalog(tmp_path, monkeypatch):
     monkeypatch.setenv("FIRSTCODER_PROVIDER", "deepseek")
     (tmp_path / "firstcoder.toml").write_text(

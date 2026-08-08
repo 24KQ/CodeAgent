@@ -24,6 +24,7 @@ HELP_COMMANDS = [
     ("/compact", "Compact context now."),
     ("/remember <text> [--promote <topic>] [--global]", "Capture or promote memory."),
     ("/memory [--global] [query]", "Show or search visible memory."),
+    ("/dream", "Consolidate workspace memory now."),
     ("/mode", "Show permission mode."),
     ("/mode <standard|aggressive|bypass>", "Change permission mode."),
     ("/mcp list", "List MCP server status."),

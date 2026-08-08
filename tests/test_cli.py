@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 import firstcoder.cli as cli
 from firstcoder.cli import CliConfig, main, read_message, run_repl
+from firstcoder.app.commands import CommandResult
 
 
 @dataclass
@@ -55,6 +56,17 @@ class FakeCliApp:
 
     def run(self) -> None:
         self.run_count += 1
+
+
+class FakeCommandHandler:
+    """为 REPL 命令路由提供最小可观察 fake。"""
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+
+    def handle(self, text: str) -> CommandResult:
+        self.commands.append(text)
+        return CommandResult(handled=text.startswith("/dream"), output="dream scheduled")
 
 
 def test_read_message_prefers_argument_over_stdin():
@@ -312,6 +324,19 @@ def test_run_repl_sends_multiple_user_messages(capsys):
     assert capsys.readouterr().out == "FirstCoder> first reply\nFirstCoder> second reply\n"
 
 
+def test_run_repl_routes_dream_to_command_handler_without_provider_call(capsys):
+    """CLI 手动 dream 走 scheduler 命令，不应把 slash 文本送进主 provider。"""
+
+    runner = FakeChatRunner(replies=[FakeResponse("normal reply")])
+    commands = FakeCommandHandler()
+
+    run_repl(runner, ["/dream", "normal"], command_handler=commands)
+
+    assert commands.commands == ["/dream"]
+    assert runner.turns == ["normal"]
+    assert "FirstCoder> dream scheduled" in capsys.readouterr().out
+
+
 def test_run_repl_routes_next_line_to_pending_permission(capsys):
     runner = FakeChatRunner(
         replies=[
@@ -326,6 +351,21 @@ def test_run_repl_routes_next_line_to_pending_permission(capsys):
     assert runner.turns == ["write file"]
     assert runner.resumes == [("perm_1", "allow_once")]
     assert capsys.readouterr().out == ("FirstCoder> need permission\n" "Permission> Allow?\n" "Choose:\n" "  1. Deny\n" "  2. Allow once\n" "  3. Allow always for same scope\n" "FirstCoder> done\n")
+
+
+def test_run_repl_does_not_consume_pending_permission_answer_as_dream_command(capsys):
+    """pending 权限确认期间的 /dream 必须仍是用户回答，而不是旁路命令。"""
+
+    runner = FakeChatRunner(
+        replies=[FakeResponse("need permission"), FakeResponse("done")],
+        pending_after_turn=FakePending(id="perm_1", kind="permission_confirmation", question="Allow?"),
+    )
+    commands = FakeCommandHandler()
+
+    run_repl(runner, ["write file", "/dream", "allow_once"], command_handler=commands)
+
+    assert commands.commands == []
+    assert runner.resumes == [("perm_1", "allow_once")]
 
 
 def test_run_repl_accepts_human_permission_aliases(capsys):

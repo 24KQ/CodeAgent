@@ -35,6 +35,34 @@ def cross_process_lock(lock_path: Path) -> Iterator[None]:
         yield
 
 
+@contextmanager
+def try_cross_process_lock(lock_path: Path) -> Iterator[bool]:
+    """尝试取得独占锁，忙时立即返回 ``False`` 而不是阻塞调用方。
+
+    普通 durable 写入必须等待锁以保证提交顺序；scheduler 的触发入口则位于
+    主 turn 收口路径，不能为了等待另一个进程的 provider 调用而阻塞用户。两种
+    语义共用同一 portalocker 文件，只在等待策略上分开。
+    """
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = portalocker.Lock(
+        lock_path,
+        mode="a+b",
+        flags=portalocker.LOCK_EX | portalocker.LOCK_NB,
+    )
+    try:
+        # LOCK_NB 只改变底层锁标志；portalocker 默认仍会按 5 秒超时重试。
+        # scheduler 触发位于普通 turn 收口路径，必须把“忙”变成一次即时结果。
+        lock.acquire(timeout=0, fail_when_locked=True)
+    except portalocker.exceptions.AlreadyLocked:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        lock.release()
+
+
 def atomic_write_bytes(path: Path, data: bytes) -> None:
     """Write `data` to `path` atomically: same-dir temp file + fsync + rename.
 
