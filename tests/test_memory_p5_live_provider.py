@@ -18,6 +18,7 @@ import os
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -48,6 +49,10 @@ LIVE_PROJECT_ROOT_ENV = "FIRSTCODER_LIVE_PROJECT_ROOT"
 LIVE_MODEL_REF_ENV = "FIRSTCODER_LIVE_MODEL_REF"
 LIVE_CASES_ENV = "FIRSTCODER_LIVE_MEMORY_CASES"
 LIVE_ARTIFACT_DIR_ENV = "FIRSTCODER_LIVE_ARTIFACT_DIR"
+LIVE_MAX_TOKENS_ENV = "FIRSTCODER_LIVE_MAX_TOKENS"
+# reasoning provider 需要为内部推理和最终短答案共同预留 output budget；512
+# 对 DeepSeek v4-flash 的完整 challenge 不够，导致合法回答被截断。
+DEFAULT_LIVE_MAX_TOKENS = 2048
 # 默认一个正常 recall + 一个 stale/scope 安全拒绝 case；真实 provider 仍只需
 # 两个可控请求，既能观察回答质量，也能覆盖 fixture 的 provenance 语义。
 DEFAULT_LIVE_CASES = ("direct_recall_001", "temporal_rejection_001")
@@ -138,6 +143,47 @@ class _ToollessLiveProvider(ChatProvider):
 
 def _is_truthy_env(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _live_max_tokens(profile: ModelProfile) -> int:
+    """解析 live benchmark 的输出预算，并尊重模型配置的更小上限。
+
+    真实 provider benchmark 与 CI fixture 共用 AgentLoop，但它的成本边界应由
+    benchmark 环境显式控制。默认值针对 reasoning provider 的内部推理开销，
+    ``FIRSTCODER_LIVE_MAX_TOKENS`` 允许低成本 smoke 或单模型实验覆盖；模型
+    profile 若声明了更小的上限，仍然不能被测试环境放大。
+    """
+
+    raw = os.getenv(LIVE_MAX_TOKENS_ENV, "").strip()
+    if raw:
+        try:
+            requested = int(raw)
+        except ValueError as error:
+            pytest.fail(f"{LIVE_MAX_TOKENS_ENV} must be a positive integer")
+            raise AssertionError("unreachable") from error
+        if requested <= 0:
+            pytest.fail(f"{LIVE_MAX_TOKENS_ENV} must be a positive integer")
+    else:
+        requested = DEFAULT_LIVE_MAX_TOKENS
+
+    configured = profile.request.max_tokens
+    return min(configured, requested) if configured is not None else requested
+
+
+def _configure_live_memory_projection(
+    session: AgentSession,
+    case: MemoryFixtureCase,
+) -> None:
+    """让真实 AgentLoop 与 provider-free fixture 使用同一个 note 数量上限。
+
+    ``MemoryFixtureCase.limit`` 是 fixture 的证据选择契约，而生产 projector
+    的默认上限是 5。live runner 每个 case 都使用独立 session，因此在请求前
+    调整该 session 的 projector 不会改变生产默认值，也不会让不同 case 共享
+    状态；否则 limit=1 的更新/干扰场景会把旧 note 一起注入 provider，导致
+    benchmark 把“回答正确但证据过量”错误记录成 precision 失败。
+    """
+
+    session.memory_projector.max_notes = case.limit
 
 
 def _live_project_root() -> Path:
@@ -280,13 +326,12 @@ def _run_provider_case(
 ) -> _LiveRun:
     """通过真实 AgentLoop 执行一个 case，并只返回可脱敏的观察数据。"""
 
+    _configure_live_memory_projection(session, case)
     request_options = MainRequestOptions(
-        # live smoke 只需要短答案；低输出上限同时限制意外成本，且不改变
-        # provider factory、AgentLoop 或 memory projector 的真实执行路径。
+        # live benchmark 仍然限制单次输出，但必须给 reasoning provider 留出
+        # 内部推理预算；具体值由模型配置或 live 环境变量控制。
         temperature=profile.request.temperature if profile.request.temperature is not None else 0.0,
-        # DeepSeek 等 reasoning provider 会先消耗一部分 output budget 做内部
-        # 推理；256 可能在最终短答案前截断，live smoke 使用 512 仍保持低成本。
-        max_tokens=min(profile.request.max_tokens or 512, 512),
+        max_tokens=_live_max_tokens(profile),
         extra_body=profile.request.extra_body,
     )
     loop = AgentLoop(
@@ -410,6 +455,57 @@ def _assert_artifact_is_separate(
         resolved_store = store.root.resolve()
         if resolved_artifact == resolved_store or resolved_store in resolved_artifact.parents:
             raise AssertionError("benchmark artifact directory must be separate from memory stores")
+
+
+def test_live_max_tokens_respects_environment_and_model_profile(monkeypatch) -> None:
+    """live 输出预算默认足够完成 reasoning，并可由环境变量缩小。"""
+
+    profile = SimpleNamespace(request=SimpleNamespace(max_tokens=None))
+    monkeypatch.delenv(LIVE_MAX_TOKENS_ENV, raising=False)
+    assert _live_max_tokens(profile) == DEFAULT_LIVE_MAX_TOKENS
+
+    monkeypatch.setenv(LIVE_MAX_TOKENS_ENV, "1024")
+    assert _live_max_tokens(profile) == 1024
+
+    profile.request.max_tokens = 512
+    assert _live_max_tokens(profile) == 512
+
+
+def test_live_projection_honors_fixture_note_limit(tmp_path: Path) -> None:
+    """真实 live projector 必须与 provider-free fixture 使用相同的 limit。"""
+
+    case = next(case for case in build_contract_cases() if case.case_id == "irrelevant_distractor_001")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_store = DurableMemoryStore(workspace / "global-memory", global_store=True)
+    session = _new_session(workspace, session_id="live-limit-check", global_store=global_store)
+    durable_case = _persist_fixture_case(session, case)
+
+    _configure_live_memory_projection(session, durable_case)
+    result = session.memory_projector.retrieve(durable_case.query)
+
+    assert durable_case.limit == 1
+    assert len(result.selected_notes) == durable_case.limit
+
+
+def test_live_fixture_preserves_superseded_status(tmp_path: Path) -> None:
+    """live durable fixture 必须保留更新场景中旧 note 的 superseded 状态。"""
+    case = next(case for case in build_challenge_cases() if case.case_id == "knowledge_update_005")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    global_store = DurableMemoryStore(workspace / "global-memory", global_store=True)
+    session = _new_session(workspace, session_id="live-superseded-check", global_store=global_store)
+
+    _persist_fixture_case(session, case)
+
+    by_text = {
+        note["text"]: note["status"]
+        for note in session.memory_store.snapshot(workspace)
+    }
+    assert by_text == {
+        fixture_note.text: fixture_note.status
+        for fixture_note in case.notes
+    }
 
 
 def test_live_provider_memory_benchmark_is_explicit_and_isolated(tmp_path: Path) -> None:
