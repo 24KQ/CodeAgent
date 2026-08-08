@@ -11,6 +11,7 @@ verification、context usage、provider cost 和 final readiness 使用同一份
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from firstcoder.context.token_budget import ContextBudget, estimate_text_tokens
 from firstcoder.context.usage_calibration import ContextPressureController
 from firstcoder.harness.evidence import update_evidence_summaries
 from firstcoder.harness.final_readiness import evaluate_final_readiness
+from firstcoder.harness.ports import RunArtifactStore
 from firstcoder.harness.provider_call import ProviderCallMetadata, UsageSnapshot
 from firstcoder.harness.report import build_report
 from firstcoder.harness.run_store import RunStore
@@ -73,6 +75,7 @@ class RunRecorder:
         session: Any,
         user_request: str,
         readiness_mode: str = "warn",
+        artifact_store_factory: Callable[[Path], RunArtifactStore] | None = None,
     ) -> None:
         self.session = session
         self.user_request = str(user_request)
@@ -83,7 +86,8 @@ class RunRecorder:
         # 首次 provider 调用前收到取消信号，因此这里只保存根路径，避免
         # harness 的初始化写盘抢在真正的 provider 请求之前。
         self._run_store_root = Path(session.store.root) / "runs"
-        self.run_store: RunStore | None = None
+        self._artifact_store_factory = artifact_store_factory or RunStore
+        self.run_store: RunArtifactStore | None = None
         self.task_state = TaskState.create(
             task_id=_task_id(session),
             user_request=self.user_request,
@@ -108,6 +112,31 @@ class RunRecorder:
         self._materialized = False
         self._pending_events: list[tuple[str, dict[str, Any]]] = []
         self._finished = False
+        self._harness_write_disabled = False
+
+    def _mark_harness_degraded(self, error: Exception) -> None:
+        """记录旁路 artifact 故障，并永久停止后续写盘尝试。
+
+        主 AgentLoop 的 provider、工具和 session 都不依赖这个标记；一旦
+        artifact 写入失败，继续重试只会让同一个故障反复覆盖主流程异常。
+        """
+
+        self._harness_write_disabled = True
+        if not self.task_state.harness_degraded:
+            self.task_state.harness_degraded = True
+            self.task_state.harness_degradation_reason = "artifact_persistence_failed"
+
+    def _safe_artifact_write(self, operation: Callable[[], Any]) -> bool:
+        """执行一个持久化动作；失败时只降级 harness。"""
+
+        if self._harness_write_disabled:
+            return False
+        try:
+            operation()
+        except Exception as exc:  # noqa: BLE001 - 旁路故障不能替换主流程异常
+            self._mark_harness_degraded(exc)
+            return False
+        return True
 
     @property
     def run_id(self) -> str:
@@ -138,28 +167,36 @@ class RunRecorder:
             )
         )
 
-    def _materialize(self) -> None:
+    def _materialize(self) -> bool:
         """首次需要持久化时创建 run store，并按原顺序刷出内存事件。"""
 
         self.start()
+        if self._harness_write_disabled:
+            return False
         if self._materialized:
-            return
-        run_store = RunStore(self._run_store_root)
-        self.run_store = run_store
-        self.trace_writer = TraceWriter(
-            run_store,
-            self.security,
-            consumers=[EvidenceSummaryConsumer()],
-        )
-        self._materialized = True
-        pending_events = self._pending_events
-        self._pending_events = []
-        run_store.start_run(
-            self.task_state,
-            task_state_payload=self.security.redact_artifact(self.task_state.to_dict()),
-        )
-        for event, payload in pending_events:
-            self.trace_writer.emit(self.task_state, event, payload)
+            return True
+        try:
+            run_store = self._artifact_store_factory(self._run_store_root)
+            trace_writer = TraceWriter(
+                run_store,
+                self.security,
+                consumers=[EvidenceSummaryConsumer()],
+            )
+            pending_events = self._pending_events
+            self._pending_events = []
+            run_store.start_run(
+                self.task_state,
+                task_state_payload=self.security.redact_artifact(self.task_state.to_dict()),
+            )
+            self.run_store = run_store
+            self.trace_writer = trace_writer
+            self._materialized = True
+            for event, payload in pending_events:
+                trace_writer.emit(self.task_state, event, payload)
+        except Exception as exc:  # noqa: BLE001 - artifact 故障必须降级
+            self._mark_harness_degraded(exc)
+            return False
+        return True
 
     def _emit(self, event: str, payload: dict[str, Any] | None = None) -> None:
         """统一写入入口：未物化时排队，物化后交给脱敏 trace writer。"""
@@ -168,10 +205,13 @@ class RunRecorder:
         if not self._materialized:
             self._pending_events.append((str(event), dict(payload or {})))
             return
+        if self._harness_write_disabled:
+            return
         trace_writer = self.trace_writer
         if trace_writer is None:  # pragma: no cover - 物化状态由本类内部维护
-            raise RuntimeError("run recorder trace writer is not initialized")
-        trace_writer.emit(self.task_state, event, payload)
+            self._mark_harness_degraded(RuntimeError("run recorder trace writer is not initialized"))
+            return
+        self._safe_artifact_write(lambda: trace_writer.emit(self.task_state, event, payload))
 
     def record_prompt_built(self, prepared: Any, provider: Any) -> None:
         """记录一次已经完成预算计算的 provider prompt。"""
@@ -240,6 +280,7 @@ class RunRecorder:
             request_at=now_iso(),
             prompt_estimated_tokens=budget.input_tokens,
             prompt_estimation_source="firstcoder_context_budget",
+            call_kind="main",
         )
         self._active_calls[metadata.call_id] = metadata
         self.task_state.record_attempt()
@@ -323,6 +364,132 @@ class RunRecorder:
                 "finish_reason": metadata.finish_reason,
                 "error_type": error_type,
                 "error": str(error),
+            },
+        )
+
+    def record_auxiliary_provider_requested(
+        self,
+        *,
+        request: Any,
+        request_id: str,
+        projection_fingerprint: str,
+        provider: Any,
+        call_kind: str,
+    ) -> None:
+        """记录隐藏 provider 请求，但不把它投影为 session 消息。
+
+        task-boundary classifier 等内部调用没有 ``PreparedMainRequest`` 和
+        主上下文预算对象，因此这里使用同一套 request/fingerprint/call
+        metadata 契约，按消息字符数生成可比较的估算值。
+        """
+
+        self.start()
+        estimated_tokens = estimate_text_tokens(
+            "\n".join(str(getattr(message, "content", "") or "") for message in getattr(request, "messages", []))
+        )
+        metadata = ProviderCallMetadata(
+            call_id=str(request_id),
+            session_id=self.task_state.session_id,
+            turn_id=self.task_state.task_id,
+            provider=str(provider.name),
+            model=str(provider.model),
+            projection_fingerprint=str(projection_fingerprint),
+            protocol=_provider_protocol(provider),
+            base_url=str(getattr(provider, "base_url", "") or ""),
+            request_at=now_iso(),
+            prompt_estimated_tokens=estimated_tokens,
+            prompt_estimation_source="firstcoder_auxiliary_message_chars",
+            call_kind=str(call_kind),
+        )
+        self._active_calls[metadata.call_id] = metadata
+        prompt_metadata = {
+            "schema_version": "firstcoder.prompt_metadata.v1",
+            "provider": metadata.provider,
+            "provider_base_url": metadata.base_url,
+            "model": metadata.model,
+            "request_id": metadata.call_id,
+            "projection_fingerprint": metadata.projection_fingerprint,
+            "call_kind": metadata.call_kind,
+            "context_usage": {
+                "total_estimated_tokens": estimated_tokens,
+                "estimated_input_tokens": estimated_tokens,
+                "estimation_method": "firstcoder_auxiliary_message_chars",
+                "usage_source": "estimated",
+            },
+        }
+        self._emit(
+            "prompt_built",
+            {
+                "prompt_metadata": prompt_metadata,
+                "request_id": metadata.call_id,
+                "projection_fingerprint": metadata.projection_fingerprint,
+                "call_kind": metadata.call_kind,
+                "estimated_input_tokens": estimated_tokens,
+                "input_chars": sum(len(str(getattr(message, "content", "") or "")) for message in getattr(request, "messages", [])),
+            },
+        )
+        self.task_state.record_attempt()
+        self._emit(
+            "model_requested",
+            {
+                "provider_call": metadata.to_dict(),
+                "request_id": metadata.call_id,
+                "projection_fingerprint": metadata.projection_fingerprint,
+                "call_kind": metadata.call_kind,
+                "provider_protocol": metadata.protocol,
+                "provider_model": metadata.model,
+            },
+        )
+
+    def record_auxiliary_provider_response(
+        self,
+        *,
+        request_id: str,
+        projection_fingerprint: str,
+        provider: Any,
+        response: Any | None = None,
+        error: Exception | None = None,
+        error_type: str = "provider",
+    ) -> None:
+        """完成隐藏请求的 request/response 配对，失败也只写旁路事实。"""
+
+        self.start()
+        metadata = self._active_calls.pop(str(request_id), None)
+        if metadata is None:
+            return
+        metadata.response_at = now_iso()
+        metadata.projection_fingerprint = str(projection_fingerprint)
+        if error is not None:
+            metadata.finish_reason = str(error_type or "error")
+            metadata.error = str(error)
+            self._emit(
+                "model_parsed",
+                {
+                    "request_id": metadata.call_id,
+                    "projection_fingerprint": metadata.projection_fingerprint,
+                    "call_kind": metadata.call_kind,
+                    "provider_call": metadata.to_dict(),
+                    "provider_call_metadata": metadata.to_dict(),
+                    "error_type": str(error_type),
+                    "error": str(error),
+                },
+            )
+            return
+        metadata.finish_reason = str(getattr(response, "finish_reason", "") or "")
+        metadata.usage = UsageSnapshot.from_usage(getattr(response, "usage", None))
+        completion = _completion_metadata(metadata, provider)
+        self._emit(
+            "model_parsed",
+            {
+                "request_id": metadata.call_id,
+                "projection_fingerprint": metadata.projection_fingerprint,
+                "call_kind": metadata.call_kind,
+                "provider_call": metadata.to_dict(),
+                "provider_call_metadata": metadata.to_dict(),
+                "completion_metadata": completion,
+                "finish_reason": metadata.finish_reason,
+                "output_chars": len(str(getattr(response, "content", "") or "")),
+                "estimated_output_tokens": estimate_text_tokens(str(getattr(response, "content", "") or "")),
             },
         )
 
@@ -448,42 +615,50 @@ class RunRecorder:
 
         if self._finished:
             return
-        self.start()
-        stop_reason = map_turn_outcome(
-            status=AgentTurnStatus.COMPLETED.value,
-            finish_reason=response.finish_reason,
-        ) or STOP_REASON_FINAL_ANSWER_RETURNED
-        if stop_reason == STOP_REASON_FINAL_ANSWER_RETURNED:
-            self.task_state.finish_success(str(response.content or ""))
-        else:
-            self.task_state.stop(stop_reason, status=STATUS_STOPPED, final_answer=str(response.content or ""))
-        stop_reason = self._write_terminal_events(stop_reason=stop_reason, response=response)
-        self._write_report()
-        self._finished = True
+        try:
+            self.start()
+            stop_reason = map_turn_outcome(
+                status=AgentTurnStatus.COMPLETED.value,
+                finish_reason=response.finish_reason,
+            ) or STOP_REASON_FINAL_ANSWER_RETURNED
+            if stop_reason == STOP_REASON_FINAL_ANSWER_RETURNED:
+                self.task_state.finish_success(str(response.content or ""))
+            else:
+                self.task_state.stop(stop_reason, status=STATUS_STOPPED, final_answer=str(response.content or ""))
+            stop_reason = self._write_terminal_events(stop_reason=stop_reason, response=response)
+            self._write_report()
+        except Exception as exc:  # noqa: BLE001 - harness 故障不得改变主回答
+            self._mark_harness_degraded(exc)
+        finally:
+            self._finished = True
 
     def fail(self, error: Exception, *, error_type: str = "provider") -> None:
         """为未产生最终 ChatResponse 的异常写出失败 run。"""
 
         if self._finished:
             return
-        self.start()
-        finish_reason = (
-            error_type if error_type in {"cancelled", "interrupted"} else "error"
-        )
-        stop_reason = map_turn_outcome(
-            status=AgentTurnStatus.COMPLETED.value,
-            finish_reason=finish_reason,
-            error_type=error_type,
-        )
-        self.task_state.stop(
-            stop_reason or "model_error",
-            status=STATUS_FAILED,
-            final_answer="",
-        )
-        self._emit("run_error", {"error": str(error), "error_type": error_type})
-        self._write_terminal_events(stop_reason=self.task_state.stop_reason, response=None)
-        self._write_report()
-        self._finished = True
+        try:
+            self.start()
+            finish_reason = (
+                error_type if error_type in {"cancelled", "interrupted"} else "error"
+            )
+            stop_reason = map_turn_outcome(
+                status=AgentTurnStatus.COMPLETED.value,
+                finish_reason=finish_reason,
+                error_type=error_type,
+            )
+            self.task_state.stop(
+                stop_reason or "model_error",
+                status=STATUS_FAILED,
+                final_answer="",
+            )
+            self._emit("run_error", {"error": str(error), "error_type": error_type})
+            self._write_terminal_events(stop_reason=self.task_state.stop_reason, response=None)
+            self._write_report()
+        except Exception as exc:  # noqa: BLE001 - 保留原始 provider/tool 异常
+            self._mark_harness_degraded(exc)
+        finally:
+            self._finished = True
 
     def _write_terminal_events(self, *, stop_reason: str, response: Any | None) -> str:
         # readiness 需要看到此前排队的 tool_executed 变更路径，所以终局判定
@@ -535,10 +710,12 @@ class RunRecorder:
     def _write_report(self) -> None:
         """从终局 TaskState 聚合 report，避免报告重新读取未脱敏 trace。"""
 
-        self._materialize()
+        if not self._materialize():
+            return
         run_store = self.run_store
         if run_store is None:  # pragma: no cover - _materialize 已保证初始化
-            raise RuntimeError("run recorder store is not initialized")
+            self._mark_harness_degraded(RuntimeError("run recorder store is not initialized"))
+            return
         root = self.workspace_root or Path.cwd()
         self.task_state.verifier_suggestions = build_verifier_suggestions(
             root,
@@ -546,10 +723,13 @@ class RunRecorder:
         )
         # suggestions 是终局阶段才知道的字段，必须在 report 之外同步回 TaskState，
         # 否则 live inspector 看到的 task_state.json 会落后于 report.json。
-        run_store.write_task_state(
-            self.task_state,
-            payload=self.security.redact_artifact(self.task_state.to_dict()),
-        )
+        if not self._safe_artifact_write(
+            lambda: run_store.write_task_state(
+                self.task_state,
+                payload=self.security.redact_artifact(self.task_state.to_dict()),
+            )
+        ):
+            return
         prompt_metadata = dict(self._last_prompt_metadata)
         prompt_metadata["request_count"] = len(self._prompt_records)
         prompt_metadata["requests"] = list(self._prompt_records)
@@ -563,7 +743,9 @@ class RunRecorder:
             compactions=compactions,
             redacted_env={"secret_env_count": len(self.security.detected_secret_env_items())},
         )
-        run_store.write_report(self.task_state, self.security.redact_artifact(report))
+        self._safe_artifact_write(
+            lambda: run_store.write_report(self.task_state, self.security.redact_artifact(report))
+        )
 
 
 def _session_workspace_root(session: Any) -> Path | None:

@@ -61,6 +61,9 @@ class TaskState:
     # P4 readiness 读取这两类运行时证据；P5 的 runtime consumers 负责持续填充。
     runtime_reminders: list = field(default_factory=list)
     todo_changes: list = field(default_factory=list)
+    # harness 是旁路审计能力；写盘故障必须可观察，但不能改变主 AgentLoop 结果。
+    harness_degraded: bool = False
+    harness_degradation_reason: str = ""
 
     @classmethod
     def create(
@@ -108,6 +111,8 @@ class TaskState:
             verifier_suggestions=list(data.get("verifier_suggestions", []) or []),
             runtime_reminders=list(data.get("runtime_reminders", []) or []),
             todo_changes=list(data.get("todo_changes", []) or []),
+            harness_degraded=bool(data.get("harness_degraded", False)),
+            harness_degradation_reason=str(data.get("harness_degradation_reason", "")),
         )
 
     def record_attempt(self) -> "TaskState":
@@ -163,4 +168,6 @@ class TaskState:
             "verifier_suggestions": list(self.verifier_suggestions),
             "runtime_reminders": list(self.runtime_reminders),
             "todo_changes": list(self.todo_changes),
+            "harness_degraded": self.harness_degraded,
+            "harness_degradation_reason": self.harness_degradation_reason,
         }

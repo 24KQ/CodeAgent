@@ -186,6 +186,13 @@ def run_single_turn(config: CliConfig) -> str:
         return run_benchmark_turn(config)
     app = create_cli_app(config)
     try:
+        # 单消息入口与 REPL/TUI 共享同一条 slash command 边界；否则脚本模式下
+        # `/remember`、`/memory` 或未知命令会被误送给 provider，破坏命令契约。
+        if config.message.lstrip().startswith("/"):
+            result = app.command_handler.handle(config.message)
+            if result.handled:
+                return result.output
+            return f"Unknown command: {' '.join(config.message.split())}"
         response = app.chat_runner.run_user_turn(config.message)
         return response.content
     finally:
@@ -412,14 +419,17 @@ def run_repl(
                 line = choice
             response = chat_runner.resume_with_user_input(_pending_id(pending), line)
         else:
-            # 只有没有待处理用户输入时才拦截维护命令；权限确认期间的每一行
-            # 都属于对 pending request 的回答，不能被旁路命令吞掉。
-            # TUI 则由同一个 CompositeCommandHandler 在自己的 pending 边界处理。
-            if command_handler is not None and (line == "/dream" or line.startswith("/dream ")):
-                result = command_handler.handle(line)
-                if result.handled:
-                    print(f"FirstCoder> {result.output}")
-                    continue
+            # 只有没有待处理用户输入时才拦截所有 slash command；权限确认期间
+            # 的每一行都属于对 pending request 的回答，不能被旁路命令吞掉。
+            # 未知 slash 也必须停在命令层，不能悄悄作为自然语言发给 provider。
+            if line.startswith("/"):
+                if command_handler is not None:
+                    result = command_handler.handle(line)
+                    output = result.output if result.handled else f"Unknown command: {' '.join(line.split())}"
+                else:
+                    output = f"Unknown command: {' '.join(line.split())}"
+                print(f"FirstCoder> {output}")
+                continue
             response = chat_runner.run_user_turn(line)
 
         print(f"FirstCoder> {response.content}")

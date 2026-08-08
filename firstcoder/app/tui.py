@@ -19,6 +19,7 @@ from uuid import uuid4
 
 import anyio
 
+from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.events import Key

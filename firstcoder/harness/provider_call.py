@@ -64,6 +64,9 @@ class ProviderCallMetadata:
     # 放在旧字段末尾，保留历史位置参数构造的含义；memory benchmark 用它把
     # provider call 与同一次完整 prompt 投影确定性关联起来。
     projection_fingerprint: str = ""
+    # 主请求默认为 ``main``；隐藏的 task-boundary 分类等旁路请求必须显式
+    # 标记 call_kind，便于报告按调用职责区分，而不把 response 写入 session history。
+    call_kind: str = "main"
 
     def to_dict(self) -> dict:
         payload = asdict(self)

@@ -21,6 +21,8 @@ from typing import Iterator
 
 import portalocker
 
+from firstcoder.memory.paths import ensure_no_link_in_ancestors
+
 
 @contextmanager
 def cross_process_lock(lock_path: Path) -> Iterator[None]:
@@ -69,7 +71,11 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
     A crash or concurrent reader sees either the old content or the new
     content, never a partial write. On failure the temp file is removed.
     """
+    # temp+replace 只能保证文件内容原子；祖先目录若是链接，仍可能把整个
+    # 原子写导向 workspace 外，因此在创建 temp 文件前检查完整祖先链。
+    ensure_no_link_in_ancestors(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_no_link_in_ancestors(path)
     fd, temp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as handle:

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from typing import Protocol
 
 from firstcoder.agent.session import AgentSession
 from firstcoder.context.context_builder import ContextBuilder
@@ -65,6 +64,11 @@ class TaskBoundaryClassifier:
         reserve_provider_call: Callable[[], None],
         check_turn_timeout: Callable[[], None],
         tag_task_boundary_messages: Callable[[dict[str, object]], None],
+        record_auxiliary_provider_request: Callable[[ChatRequest, str], str] | None = None,
+        record_auxiliary_provider_response: Callable[
+            [str, ChatRequest, ChatResponse | None, Exception | None, str], None
+        ]
+        | None = None,
     ) -> None:
         self.session = session
         self.provider = provider
@@ -74,6 +78,8 @@ class TaskBoundaryClassifier:
         self._reserve_provider_call = reserve_provider_call
         self._check_turn_timeout = check_turn_timeout
         self._tag_task_boundary_messages = tag_task_boundary_messages
+        self._record_auxiliary_provider_request = record_auxiliary_provider_request
+        self._record_auxiliary_provider_response = record_auxiliary_provider_response
 
     def classify(self, basis_message_id: str) -> None:
         """运行隐藏的 JSON 分类，并把有效结果写入既有边界状态机。"""
@@ -98,7 +104,13 @@ class TaskBoundaryClassifier:
                 self._reserve_provider_call()
                 self._check_turn_timeout()
                 self._check_cancelled()
-                response = await self.provider.acomplete(request)
+                request_id = self._record_request(request)
+                try:
+                    response = await self.provider.acomplete(request)
+                except Exception as exc:
+                    self._record_response(request_id, request, None, exc)
+                    raise
+                self._record_response(request_id, request, response, None)
             except ProviderError:
                 continue
             decision = parse_task_boundary_classification(response.content, basis_message_id=basis_message_id)
@@ -112,7 +124,41 @@ class TaskBoundaryClassifier:
         self._reserve_provider_call()
         self._check_turn_timeout()
         self._check_cancelled()
-        return self.provider.complete(request)
+        request_id = self._record_request(request)
+        try:
+            response = self.provider.complete(request)
+        except Exception as exc:
+            self._record_response(request_id, request, None, exc)
+            raise
+        self._record_response(request_id, request, response, None)
+        return response
+
+    def _record_request(self, request: ChatRequest) -> str:
+        """把内部请求交给 AgentLoop 的统一 harness callback。"""
+
+        if self._record_auxiliary_provider_request is None:
+            return ""
+        return str(self._record_auxiliary_provider_request(request, "task_boundary_classifier"))
+
+    def _record_response(
+        self,
+        request_id: str,
+        request: ChatRequest,
+        response: ChatResponse | None,
+        error: Exception | None,
+    ) -> None:
+        if self._record_auxiliary_provider_response is None or not request_id:
+            return
+        error_type = "provider"
+        if isinstance(error, ProviderError):
+            error_type = error.kind.value
+        self._record_auxiliary_provider_response(
+            request_id,
+            request,
+            response,
+            error,
+            error_type,
+        )
 
     def build_request(self, *, attempt: int) -> ChatRequest:
         messages = self.context_builder.build_provider_messages(

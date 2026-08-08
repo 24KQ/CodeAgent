@@ -70,6 +70,10 @@ _WINDOWS_RESERVED_NAMES = frozenset(
 )
 
 
+class StaleMemorySnapshotError(ValueError):
+    """维护提交基于旧 index 快照时拒绝覆盖并发写入。"""
+
+
 def note_id_for(topic_slug: str, note_text: str) -> str:
     return hashlib.sha256(f"{topic_slug}\n{note_text}".encode("utf-8")).hexdigest()[:12]
 
@@ -155,14 +159,17 @@ class DurableMemoryStore:
         写前守卫：root/topics/logs 目录若被预置为 symlink/junction，原子
         写会被导向 workspace 外（Codex P2 review #1，P1 项）——拒绝写入。
         """
-        # root 本身也可能在 store 创建后被替换成链接；先检查 root，再创建
-        # topics/logs，避免只检查子目录却已经沿着 root 重解析点越界。
+        # root 本身也可能在 store 创建后被替换成链接；先只建立锁文件所需的
+        # root，再把 memory layout 的创建和所有子目录检查放进 store lock。
+        # 这样并发首次初始化不会在“检查后、创建前”留下可被另一进程替换的窗口。
         ensure_no_link_or_junction(self.root)
-        ensure_memory_dir(self.root)
-        ensure_no_link_or_junction(self.root)
-        ensure_no_link_or_junction(self.root / "topics")
-        ensure_no_link_or_junction(self.root / "logs")
+        self.root.mkdir(parents=True, exist_ok=True)
         with cross_process_lock(self.lock_path):
+            ensure_no_link_or_junction(self.root)
+            ensure_memory_dir(self.root)
+            ensure_no_link_or_junction(self.root)
+            ensure_no_link_or_junction(self.root / "topics")
+            ensure_no_link_or_junction(self.root / "logs")
             yield
 
     # --- 路径与原始读写 ---------------------------------------------------
@@ -490,7 +497,12 @@ class DurableMemoryStore:
         with self._transaction():
             return self._promote_unlocked(promotions, requested_status=requested_status)
 
-    def promote_maintenance(self, notes: list[MemoryNote]) -> tuple[list[str], list[str]]:
+    def promote_maintenance(
+        self,
+        notes: list[MemoryNote],
+        *,
+        expected_index_version: int | None = None,
+    ) -> tuple[list[str], list[str]]:
         """在一个 durable 事务中提交 auto-dream 的 workspace 候选。
 
         P6 runner 的结果必须先变成 ``MemoryNote``，再经过这个入口。它拒绝
@@ -531,6 +543,15 @@ class DurableMemoryStore:
         if not promotions:
             return [], []
         with self._transaction():
+            if (
+                expected_index_version is not None
+                and self._index_version_unlocked() != expected_index_version
+            ):
+                raise StaleMemorySnapshotError(
+                    "memory maintenance snapshot is stale: "
+                    f"expected index {expected_index_version}, "
+                    f"found {self._index_version_unlocked()}"
+                )
             return self._promote_unlocked(
                 promotions,
                 evidence_by_note_id=evidence_by_note_id,
@@ -542,10 +563,12 @@ class DurableMemoryStore:
         *,
         requested_status: NoteStatus | None = None,
         evidence_by_note_id: dict[str, MemoryEvidence] | None = None,
+        metadata_overrides: dict[str, MemoryNote] | None = None,
     ) -> tuple[list[str], list[str]]:
         """在调用方已经持有 store lock 时执行通用提升。"""
 
         evidence_by_note_id = evidence_by_note_id or {}
+        metadata_overrides = metadata_overrides or {}
         topics = {topic["topic"]: topic for topic in self._load_index_unlocked()}
         topic_notes = {
             slug: [note["text"] for note in self._load_topic_notes_unlocked(slug)] for slug in topics
@@ -556,7 +579,7 @@ class DurableMemoryStore:
         for topic, note_text in promotions:
             topic = self._check_topic_slug(topic)
             # 多行 note 折叠为单行：note_id 必须基于折叠后的文本
-            # （与 `_apply_note_metadata` 共用同一 helper，见该函数）。
+            # （与 `_apply_note_metadata_values` 共用同一 helper，见该函数）。
             note_text = _fold_note_text(note_text)
             if not note_text:
                 continue
@@ -614,6 +637,14 @@ class DurableMemoryStore:
             new_meta["supersedes"] = None if inactive else supersedes
             metadata[new_meta["note_id"]] = new_meta
             results.append(f"{topic}: {note_text}")
+        # upsert 的 evidence/status/supersedes 必须在同一个 index 发布前事务内
+        # 应用；否则 promote 已发布后再补 metadata 会留下第二段提交窗口。
+        for note in metadata_overrides.values():
+            topic = self._check_topic_slug(note.topic)
+            note_id = note_id_for(topic, _fold_note_text(note.text))
+            row = topic_metadata.get(topic, {}).get(note_id)
+            if row is not None:
+                self._apply_note_metadata_values(row, note)
         # 写顺序：metadata/topic 先落盘，index 最后发布为提交点。
         for topic, notes in topic_notes.items():
             self._write_topic(topic, notes, metadata=topic_metadata.get(topic, {}))
@@ -665,7 +696,13 @@ class DurableMemoryStore:
 
     # --- P0 MemoryStorePort 形状 ----------------------------------------------
 
-    def append_daily_log(self, text: str, *, source: MemoryEvidence | None = None) -> Path | None:
+    def append_daily_log(
+        self,
+        text: str,
+        *,
+        source: MemoryEvidence | None = None,
+        quarantined: bool = False,
+    ) -> Path | None:
         """写每日日志，并把捕获时刻的 provenance 记到当天的 evidence 侧车。
 
         evidence 侧车是 FirstCoder 对 pico 格式的扩展：pico 的 daily log
@@ -678,7 +715,12 @@ class DurableMemoryStore:
         入口混用时行序一致）；进程崩溃可能留下"日志已写、侧车未写"的窗口
         （调用方会收到异常），但不会有并发撕裂。
         """
-        return append_to_daily_log(self.root, text, source=source)
+        return append_to_daily_log(
+            self.root,
+            text,
+            source=source,
+            quarantined=quarantined,
+        )
 
     def load_daily_log_evidence(self, today: "date | None" = None) -> list[dict]:
         """读取当天 evidence 侧车（P3 /remember 的证据来源）。
@@ -717,72 +759,61 @@ class DurableMemoryStore:
             requested_visibility = "global"
         if self.global_store and requested_visibility != "global":
             raise ValueError("global memory store accepts only global notes")
-        self.promote(
-            [(note.topic, note.text)],
-            requested_status=note.status,
-        )
-        self._apply_note_metadata(note)
-
-    def _apply_note_metadata(self, note: MemoryNote) -> None:
-        """把契约笔记里的 evidence/supersedes/scope 覆盖到 metadata 行。
-
-        note_id 基于折叠后的文本查找（与 `promote` 的落盘文本一致，
-        Codex P2 review #3：原实现用原始文本找行，多行 note 的 evidence
-        静默丢失）。
-        """
+        folded_text = _fold_note_text(note.text)
+        note_id = note_id_for(note.topic, folded_text)
+        # upsert 是一个完整 durable 事务：候选文本、metadata 和 index 必须由
+        # 同一次锁内提交，不能先调用 promote 再开启第二个 metadata 事务。
         with self._transaction():
-            metadata = self._load_topic_metadata(note.topic)
-            row = metadata.get(note_id_for(note.topic, _fold_note_text(note.text)))
-            if row is None:
-                return
-            # 状态更新只能单向收紧：显式 quarantined 必须覆盖此前 active
-            # 的重复 note；显式 superseded 可以隐藏 active 旧事实，但不能
-            # 反向解除文本规则或历史已确认的 quarantine，防止调用方借
-            # MemoryNote.status 绕过安全门。
-            if note.status == "quarantined":
-                row["status"] = "quarantined"
-            elif note.status == "superseded" and row.get("status") != "quarantined":
-                row["status"] = "superseded"
-            if note.evidence.session_id or note.evidence.source_path or note.evidence.scope:
-                evidence = dict(row.get("evidence") or {})
-                if note.evidence.session_id:
-                    evidence["session_id"] = note.evidence.session_id
-                if note.evidence.source_path and not self.global_store:
-                    evidence["source_path"] = note.evidence.source_path
-                if note.evidence.anchor_hash:
-                    evidence["evidence_anchor_hash"] = note.evidence.anchor_hash
-                # 锚点缺失时按 source 文件当前内容自动生成（同
-                # `_metadata_for_note`，Codex P2 review #8）。
-                if not self.global_store and not evidence.get("evidence_anchor_hash") and evidence.get("source_path"):
-                    anchor = compute_anchor_hash(
-                        source_path_for_evidence(self.workspace_root, evidence.get("source_path"))
-                    )
-                    if anchor:
-                        evidence["evidence_anchor_hash"] = anchor
-                # 统一 legacy null 和 workspace 外路径的无锚点表示，避免
-                # sidecar/metadata 在同一份证据契约中出现两种空值。
-                if not evidence.get("evidence_anchor_hash"):
-                    evidence["evidence_anchor_hash"] = ""
-                if self.global_store:
-                    evidence["source_path"] = None
-                row["evidence"] = evidence
-            # scope 落在 row 顶层（`_default_note_metadata` 约定）；
-            # 显式契约 scope（如 "global"）必须持久化；默认值 "workspace"
-            # 是契约占位，不得覆盖 promote 写入的真实 workspace fingerprint
-            # （Codex P2 review #3：原实现无条件覆盖导致指纹丢失、
-            # 检索 scope_mismatch）。
-            if note.evidence.scope and note.evidence.scope != "workspace":
-                row["scope"] = note.evidence.scope
-            visibility = note.evidence.visibility
-            if note.evidence.scope == "global":
-                visibility = "global"
+            self._promote_unlocked(
+                [(note.topic, folded_text)],
+                requested_status=note.status,
+                evidence_by_note_id={note_id: note.evidence},
+                metadata_overrides={note_id: note},
+            )
+
+    def _apply_note_metadata_values(self, row: dict, note: MemoryNote) -> None:
+        """在已加载的 metadata row 上应用契约字段，不触发额外磁盘提交。"""
+
+        # 状态更新只能单向收紧：显式 quarantined 必须覆盖此前 active
+        # 的重复 note；显式 superseded 不能解除历史 quarantine。
+        if note.status == "quarantined":
+            row["status"] = "quarantined"
+        elif note.status == "superseded" and row.get("status") != "quarantined":
+            row["status"] = "superseded"
+        if note.evidence.session_id or note.evidence.source_path or note.evidence.scope:
+            evidence = dict(row.get("evidence") or {})
+            if note.evidence.session_id:
+                evidence["session_id"] = note.evidence.session_id
+            if note.evidence.source_path and not self.global_store:
+                evidence["source_path"] = note.evidence.source_path
+            if note.evidence.anchor_hash:
+                evidence["evidence_anchor_hash"] = note.evidence.anchor_hash
+            if (
+                not self.global_store
+                and not evidence.get("evidence_anchor_hash")
+                and evidence.get("source_path")
+            ):
+                anchor = compute_anchor_hash(
+                    source_path_for_evidence(self.workspace_root, evidence.get("source_path"))
+                )
+                if anchor:
+                    evidence["evidence_anchor_hash"] = anchor
+            if not evidence.get("evidence_anchor_hash"):
+                evidence["evidence_anchor_hash"] = ""
             if self.global_store:
-                visibility = "global"
-                row["scope"] = "global"
-            row["visibility"] = visibility
-            if note.supersedes:
-                row["supersedes"] = note.supersedes
-            self._write_topic_metadata(note.topic, metadata)
+                evidence["source_path"] = None
+            row["evidence"] = evidence
+        if note.evidence.scope and note.evidence.scope != "workspace":
+            row["scope"] = note.evidence.scope
+        visibility = note.evidence.visibility
+        if note.evidence.scope == "global":
+            visibility = "global"
+        if self.global_store:
+            visibility = "global"
+            row["scope"] = "global"
+        row["visibility"] = visibility
+        if note.supersedes:
+            row["supersedes"] = note.supersedes
 
     def read_index(self) -> list[MemoryNote]:
         """契约形状的索引读取：topic -> 活跃/全部笔记（含 metadata）。

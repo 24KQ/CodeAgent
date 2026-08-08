@@ -96,3 +96,17 @@ def test_provider_call_metadata_to_dict() -> None:
     assert data["base_url"] == "https://api.deepseek.com/v1"
     assert data["usage"]["cached_input_tokens"] is None
     assert data["prompt_estimation_source"] == "estimator"
+
+
+def test_provider_call_metadata_defaults_to_main_call_kind() -> None:
+    """旧构造方式生成的主请求必须有稳定的 call_kind。"""
+
+    call = ProviderCallMetadata(
+        call_id="call_main",
+        session_id="s1",
+        turn_id="t1",
+        provider="fixture",
+        model="fixture-model",
+    )
+
+    assert call.to_dict()["call_kind"] == "main"

@@ -36,6 +36,7 @@ from firstcoder.memory.dream.state import DreamTaskState, MaintenanceStateStore
 from firstcoder.memory.durable import (
     DURABLE_TOPIC_DEFAULTS,
     DurableMemoryStore,
+    StaleMemorySnapshotError,
     note_id_for,
 )
 from firstcoder.memory.logs import daily_lock_path
@@ -415,12 +416,18 @@ class MemoryMaintenanceScheduler:
             write_scope=self.scope,
         )
         candidates, rejections = self._validate_proposal(proposal, state)
-        self.memory_store.promote_maintenance(candidates)
+        self.memory_store.promote_maintenance(
+            candidates,
+            expected_index_version=snapshot.index_version,
+        )
         after_notes = self.memory_store.snapshot(self.workspace_root)
         report = build_dream_report(
             before_notes,
             after_notes,
-            rejected_reasons=[item.reason for item in rejections],
+            rejected_reasons=[
+                *snapshot.input_rejection_reasons,
+                *(item.reason for item in rejections),
+            ],
             relative_dates_absolutized=proposal.relative_dates_absolutized,
         )
         report_path = write_dream_report(
@@ -439,8 +446,21 @@ class MemoryMaintenanceScheduler:
         state: DreamTaskState,
         before_notes: list[dict],
     ) -> MemoryMaintenanceSnapshot:
-        entries = self._load_entries(state.session_ids)
-        notes = tuple(_memory_note_from_row(note) for note in before_notes)
+        entries, entry_rejections = self._load_entries(state.session_ids)
+        notes: list[MemoryNote] = []
+        input_rejections = list(entry_rejections)
+        for row in before_notes:
+            note = _memory_note_from_row(row)
+            if note.status == "quarantined":
+                input_rejections.append("quarantined")
+                continue
+            if self.security.redact_text(note.text) != note.text:
+                input_rejections.append("secret_shaped")
+                continue
+            if not self.security.passes_quarantine(note):
+                input_rejections.append("quarantined")
+                continue
+            notes.append(note)
         identity = {
             "index_version": self.memory_store.index_version(),
             "session_ids": list(state.session_ids),
@@ -454,46 +474,76 @@ class MemoryMaintenanceScheduler:
             snapshot_id=snapshot_id,
             index_version=int(identity["index_version"]),
             session_ids=tuple(state.session_ids),
-            notes=notes,
+            notes=tuple(notes),
             entries=tuple(entries[: self.config.max_entries]),
+            input_rejection_reasons=tuple(input_rejections),
         )
 
-    def _load_entries(self, session_ids: tuple[str, ...]) -> list[MemoryMaintenanceEntry]:
+    def _load_entries(
+        self,
+        session_ids: tuple[str, ...],
+    ) -> tuple[list[MemoryMaintenanceEntry], tuple[str, ...]]:
         if not session_ids:
-            return []
+            return [], ()
         logs_root = self.memory_store.root / "logs"
         if not logs_root.is_dir():
-            return []
+            return [], ()
         ensure_no_link_or_junction(logs_root)
         wanted = set(session_ids)
         entries: list[MemoryMaintenanceEntry] = []
+        rejections: list[str] = []
         with cross_process_lock(daily_lock_path(self.memory_store.root)):
-            for path in sorted(logs_root.rglob("*.evidence.jsonl")):
-                ensure_no_link_or_junction(path)
-                try:
-                    lines = path.read_text(encoding="utf-8").splitlines()
-                except (OSError, UnicodeError):
+            # 不使用 rglob 直接遍历：若年份或月份目录是链接，rglob 会先
+            # 穿过链接再等到文件层检查，安全边界已经太晚。
+            for year_dir in sorted(logs_root.iterdir()):
+                ensure_no_link_or_junction(year_dir)
+                if not year_dir.is_dir():
                     continue
-                for line in lines:
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError:
+                for month_dir in sorted(year_dir.iterdir()):
+                    ensure_no_link_or_junction(month_dir)
+                    if not month_dir.is_dir():
                         continue
-                    if not isinstance(row, dict) or str(row.get("session_id") or "") not in wanted:
-                        continue
-                    text = self.security.redact_text(str(row.get("text") or "")).strip()
-                    if not text:
-                        continue
-                    entries.append(
-                        MemoryMaintenanceEntry(
-                            text=text[: self.config.max_entry_chars],
-                            session_id=str(row.get("session_id") or ""),
-                            source_path=_workspace_relative_source(self.workspace_root, row.get("source_path")),
-                            anchor_hash=str(row.get("evidence_anchor_hash") or ""),
-                            created_at=str(row.get("at") or ""),
-                        )
-                    )
-        return entries[-self.config.max_entries :]
+                    for path in sorted(month_dir.glob("*.evidence.jsonl")):
+                        ensure_no_link_or_junction(path)
+                        try:
+                            lines = path.read_text(encoding="utf-8").splitlines()
+                        except (OSError, UnicodeError):
+                            continue
+                        for line in lines:
+                            try:
+                                row = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if not isinstance(row, dict) or str(row.get("session_id") or "") not in wanted:
+                                continue
+                            raw_text = str(row.get("text") or "").strip()
+                            if not raw_text:
+                                continue
+                            if bool(row.get("quarantined")):
+                                rejections.append("quarantined")
+                                continue
+                            raw_note = MemoryNote(topic="capture", text=raw_text)
+                            if not self.security.passes_quarantine(raw_note):
+                                rejections.append(
+                                    "secret_shaped"
+                                    if self.security.redact_text(raw_text) != raw_text
+                                    else "quarantined"
+                                )
+                                continue
+                            text = self.security.redact_text(raw_text).strip()
+                            if not text or text != raw_text:
+                                rejections.append("secret_shaped")
+                                continue
+                            entries.append(
+                                MemoryMaintenanceEntry(
+                                    text=text[: self.config.max_entry_chars],
+                                    session_id=str(row.get("session_id") or ""),
+                                    source_path=_workspace_relative_source(self.workspace_root, row.get("source_path")),
+                                    anchor_hash=str(row.get("evidence_anchor_hash") or ""),
+                                    created_at=str(row.get("at") or ""),
+                                )
+                            )
+        return entries[-self.config.max_entries :], tuple(rejections)
 
     def _build_prompt(self, snapshot: MemoryMaintenanceSnapshot) -> str:
         notes = [
@@ -522,7 +572,7 @@ class MemoryMaintenanceScheduler:
             '"session_id":"...","reason":"...","visibility":"workspace"}],'
             '"rejections":[{"reason":"..."}],"relative_dates_absolutized":0}.\n'
             "Candidate topic must be one of project-conventions, key-decisions, "
-            "dependency-facts, user-preferences, or reference-facts.\n"
+            "dependency-facts, or user-preferences.\n"
             f"Workspace write scope: {self.scope.memory_root()}\nInput snapshot: "
         )
         payload = {
@@ -760,6 +810,8 @@ def _new_task_id(now: float) -> str:
 
 
 def _error_code(error: Exception) -> str:
+    if isinstance(error, StaleMemorySnapshotError):
+        return "stale_snapshot"
     name = type(error).__name__.lower()
     if "json" in name or "proposal" in str(error).lower():
         return "invalid_runner_result"

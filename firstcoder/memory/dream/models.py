@@ -36,6 +36,8 @@ class MemoryMaintenanceSnapshot:
     session_ids: tuple[str, ...] = ()
     notes: tuple[MemoryNote, ...] = ()
     entries: tuple[MemoryMaintenanceEntry, ...] = ()
+    # 输入侧安全过滤只保留稳定原因，不把被拒绝的原文带入 runner 或 report。
+    input_rejection_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
