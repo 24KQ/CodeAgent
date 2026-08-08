@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ElementTree
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
-ALLOWED_REASON_MARKERS = (
+ALLOWED_REASON_PREFIXES = (
     "could not import 'harbor'",
     "live provider requires",
     "live provider credential is not configured",
@@ -43,7 +43,7 @@ def skip_reasons(xml_path: Path) -> list[str]:
 
 def is_allowed_skip(reason: str) -> bool:
     normalized = reason.casefold()
-    return any(marker.casefold() in normalized for marker in ALLOWED_REASON_MARKERS)
+    return any(normalized.startswith(prefix.casefold()) for prefix in ALLOWED_REASON_PREFIXES)
 
 
 def unexpected_skips(reasons: Iterable[str]) -> list[str]:
