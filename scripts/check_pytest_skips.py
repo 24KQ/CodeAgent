@@ -45,9 +45,14 @@ def is_allowed_skip(reason: str) -> bool:
     # JUnit 对 collection skip 同时保留 pytest 的分类和正文前缀；只剥离这两个
     # 固定包装，随后仍然要求正文从已知环境原因开始，避免把任意说明文字放行。
     normalized = " ".join(reason.casefold().split())
-    for wrapper in ("collection skipped ", "skipped: "):
-        while normalized.startswith(wrapper):
-            normalized = normalized[len(wrapper) :]
+    wrappers = ("collection skipped ", "skipped: ")
+    while True:
+        for wrapper in wrappers:
+            if normalized.startswith(wrapper):
+                normalized = normalized[len(wrapper) :]
+                break
+        else:
+            break
     return any(normalized.startswith(prefix.casefold()) for prefix in ALLOWED_REASON_PREFIXES)
 
 
