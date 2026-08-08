@@ -35,6 +35,25 @@ def test_no_match_returns_empty() -> None:
     assert result.selected_notes == []
 
 
+def test_agent_prompt_stopwords_do_not_select_unrelated_note() -> None:
+    """完整 AgentLoop user prompt 不能仅因 ``is`` 命中无关项目约定。"""
+
+    state = {
+        "episodic_notes": [
+            _state_note("build tool for this project is uv"),
+        ]
+    }
+    query = (
+        "You are evaluating a durable-memory assistant. Use only relevant durable "
+        "memory provided in the context. If evidence is missing, say that you "
+        "cannot determine the answer. Question: unknown production incident case-04"
+    )
+
+    result = _retriever(state).retrieve(MemoryQuery(text=query))
+
+    assert result.selected_notes == []
+
+
 def test_exact_tag_beats_keyword_overlap() -> None:
     state = {
         "episodic_notes": [
