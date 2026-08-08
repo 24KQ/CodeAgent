@@ -41,7 +41,7 @@ def _relative_filename(filename: str) -> str:
     while normalized.startswith("./"):
         normalized = normalized[2:]
     # Windows 基线与 Ubuntu runner 的仓库绝对路径前缀不同；目标目录名是
-    # 稳定的，所以从第一个已知目标目录开始截取，避免把机器路径写进基线。
+    # 稳定的，所以从最后一个已知目标目录开始截取，避免把机器路径写进基线。
     lowered = normalized.casefold()
     for prefix in ("firstcoder/", "tests/", "scripts/"):
         marker = "/" + prefix

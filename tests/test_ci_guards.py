@@ -45,6 +45,9 @@ def test_pytest_skip_allowlist_rejects_unknown_reason(tmp_path: Path) -> None:
 
     assert is_allowed_skip(reasons[0])
     assert unexpected_skips(reasons) == ["new environment issue"]
+    assert is_allowed_skip(
+        "collection skipped Skipped: could not import 'harbor': No module named 'harbor'"
+    )
     assert is_allowed_skip("live provider requires a configured model: detail")
     assert not is_allowed_skip("known prefix was mentioned after an unrelated failure")
 

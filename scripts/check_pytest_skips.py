@@ -42,7 +42,12 @@ def skip_reasons(xml_path: Path) -> list[str]:
 
 
 def is_allowed_skip(reason: str) -> bool:
-    normalized = reason.casefold()
+    # JUnit 对 collection skip 同时保留 pytest 的分类和正文前缀；只剥离这两个
+    # 固定包装，随后仍然要求正文从已知环境原因开始，避免把任意说明文字放行。
+    normalized = " ".join(reason.casefold().split())
+    for wrapper in ("collection skipped ", "skipped: "):
+        while normalized.startswith(wrapper):
+            normalized = normalized[len(wrapper) :]
     return any(normalized.startswith(prefix.casefold()) for prefix in ALLOWED_REASON_PREFIXES)
 
 
