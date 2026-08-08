@@ -29,9 +29,20 @@ class MemoryStorePort(Protocol):
     返回写入路径，evidence 可缺省。
     """
 
-    def append_daily_log(self, text: str, *, source: MemoryEvidence | None = None) -> Path | None: ...
+    def append_daily_log(
+        self,
+        text: str,
+        *,
+        source: MemoryEvidence | None = None,
+        quarantined: bool = False,
+    ) -> Path | None: ...
     def upsert_topic(self, note: MemoryNote) -> None: ...
-    def promote_maintenance(self, notes: list[MemoryNote]) -> tuple[list[str], list[str]]: ...
+    def promote_maintenance(
+        self,
+        notes: list[MemoryNote],
+        *,
+        expected_index_version: int | None = None,
+    ) -> tuple[list[str], list[str]]: ...
     def read_index(self) -> list[MemoryNote]: ...
 
 

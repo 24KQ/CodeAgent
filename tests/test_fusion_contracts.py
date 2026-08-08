@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from firstcoder.harness.ports import (
     Redactor,
+    RunArtifactStore,
     RunReportSink,
     SessionSource,
     TraceSink,
@@ -31,6 +32,7 @@ HARNESS_PORTS = (
     SessionSource,
     TraceSink,
     RunReportSink,
+    RunArtifactStore,
     Redactor,
 )
 

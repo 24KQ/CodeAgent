@@ -96,7 +96,11 @@ class MemoryRuntime:
         )
         evidence = self._evidence()
         try:
-            self.store.append_daily_log(sanitized, source=evidence)
+            self.store.append_daily_log(
+                sanitized,
+                source=evidence,
+                quarantined=quarantined,
+            )
         except (OSError, ValueError):
             return MemoryWriteReceipt(
                 ok=False,
@@ -161,7 +165,7 @@ class MemoryRuntime:
                     visibility="global",
                 )
             target_store = self.global_store
-            # _apply_note_metadata 会把 workspace 占位 scope 改成 global；
+            # _apply_note_metadata_values 会把 workspace 占位 scope 改成 global；
             # global store 同时清除 source_path，保证跨项目读取没有错误根目录。
 
         topic_text = str(topic or "").strip()
@@ -293,6 +297,30 @@ class MemoryRuntime:
             },
         )
         return result
+
+    def permission_target(
+        self,
+        *,
+        visibility: object = "session",
+        include_capture: bool = False,
+    ) -> str:
+        """返回 memory 写入权限预检应覆盖的目录集合。
+
+        工具权限层只能看到一个字符串 target；这里集中把 workspace capture、
+        workspace topic 和 global topic 的真实根目录折叠成换行分隔值，避免
+        memory 工具各自猜测路径，也避免 global promotion 只申请了当前项目
+        的权限却实际写入用户级目录。
+        """
+
+        normalized = self._normalize_visibility(visibility) or "session"
+        roots: list[str] = []
+        if include_capture or normalized != "global":
+            roots.append(str(self.store.root))
+        if normalized == "global" and self.global_store is not None:
+            roots.append(str(self.global_store.root))
+        if not roots:
+            roots.append(str(self.store.root))
+        return "\n".join(dict.fromkeys(roots))
 
     def _evidence(self) -> MemoryEvidence:
         # scope 使用契约默认占位值，DurableMemoryStore 会在 workspace 绑定时

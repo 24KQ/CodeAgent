@@ -38,6 +38,25 @@ from firstcoder.session.index import SessionIndex
 from firstcoder.tools.types import Tool, make_error_result, make_text_result
 
 
+class FailingArtifactStore:
+    """模拟 artifact 存储故障，验证旁路故障不会污染主回答。"""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def start_run(self, task_state, *, task_state_payload=None):
+        raise OSError("fixture artifact store unavailable")
+
+    def write_task_state(self, task_state, *, payload=None):
+        raise OSError("fixture artifact store unavailable")
+
+    def append_trace(self, task_state, event):
+        raise OSError("fixture artifact store unavailable")
+
+    def write_report(self, task_state, report):
+        raise OSError("fixture artifact store unavailable")
+
+
 @dataclass
 class RecorderProvider(ChatProvider):
     """无网络 provider，用来验证真实 AgentLoop 事件边界。"""
@@ -129,6 +148,119 @@ def test_run_recorder_defers_persistence_until_terminal_artifacts_are_needed(tmp
     assert task_state_path.exists()
     assert trace_path.exists()
     assert report_path.exists()
+
+
+def test_run_recorder_degrades_when_artifact_persistence_fails(tmp_path: Path) -> None:
+    """harness 写盘失败只标记 degraded，不得把 provider 结果变成异常。"""
+
+    session = AgentSession.create(
+        store=JsonlSessionStore(tmp_path),
+        session_id="sess_degraded_harness",
+        agents_md="",
+    )
+    provider = RecorderProvider([])
+    recorder = RunRecorder(
+        session=session,
+        user_request="普通回答",
+        artifact_store_factory=FailingArtifactStore,
+    )
+    budget = ContextBudget(
+        context_window=8_192,
+        input_tokens=10,
+        output_reserve=100,
+        input_capacity=8_092,
+        fixed_tokens=0,
+        history_tokens=10,
+        high_watermark=7_282,
+        low_watermark=5_826,
+        source="assumed",
+    )
+    prepared = SimpleNamespace(
+        request_id="request-degraded",
+        projection_fingerprint="fingerprint-degraded",
+        context_budget=budget,
+        request=ChatRequest(messages=[]),
+    )
+
+    recorder.record_provider_requested(prepared, provider)
+    recorder.record_provider_response(
+        prepared,
+        provider,
+        ChatResponse(
+            provider="fixture",
+            model="fixture-model",
+            content="主回答仍然可用",
+            finish_reason="stop",
+        ),
+    )
+    recorder.finish(
+        ChatResponse(
+            provider="fixture",
+            model="fixture-model",
+            content="主回答仍然可用",
+            finish_reason="stop",
+        )
+    )
+
+    assert recorder.task_state.harness_degraded is True
+    assert recorder.task_state.harness_degradation_reason == "artifact_persistence_failed"
+
+
+def test_task_boundary_classifier_calls_are_recorded_without_session_messages(tmp_path: Path) -> None:
+    """隐藏 classifier 请求进入统一 trace，但响应不污染可恢复对话。"""
+
+    class BoundaryProvider(RecorderProvider):
+        def complete(self, request: ChatRequest) -> ChatResponse:
+            self.requests.append(request)
+            basis = next(
+                message.content.split("basis_message_id=", 1)[1].split("]", 1)[0]
+                for message in request.messages
+                if message.role == "user" and "basis_message_id=" in message.content
+            )
+            return ChatResponse(
+                provider="fixture",
+                model="fixture-model",
+                content=json.dumps({"decision": "same", "basis_message_id": basis}),
+                finish_reason="stop",
+            )
+
+    session = AgentSession.create(
+        store=JsonlSessionStore(tmp_path),
+        session_id="sess_classifier_harness",
+        agents_md="",
+    )
+    session.runtime_state.active_task_hash = "task_existing"
+    basis_message_id = session.append_user_message("继续当前任务")
+    provider = BoundaryProvider([])
+    loop = AgentLoop(session=session, provider=provider)
+    loop._ensure_run_recorder("继续当前任务")
+    loop._classify_task_boundary(basis_message_id)
+
+    loop.run_recorder.finish(
+        ChatResponse(
+            provider="fixture",
+            model="fixture-model",
+            content="完成",
+            finish_reason="stop",
+        )
+    )
+
+    assert loop.run_recorder.run_store is not None
+    trace_path = loop.run_recorder.run_store.trace_path(loop.run_recorder.task_state)
+    events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    auxiliary = [
+        event
+        for event in events
+        if event.get("call_kind") == "task_boundary_classifier"
+    ]
+    assert {event["event"] for event in auxiliary} == {
+        "prompt_built",
+        "model_requested",
+        "model_parsed",
+    }
+    assert len({event["request_id"] for event in auxiliary}) == 1
+    assert len({event["projection_fingerprint"] for event in auxiliary}) == 1
+    assert [message.role for message in session.rebuild_view().messages] == ["user"]
 
 
 def test_run_recorder_strict_readiness_persists_final_gate_blocked(tmp_path: Path) -> None:

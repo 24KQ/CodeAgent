@@ -3,7 +3,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 
 import firstcoder.cli as cli
-from firstcoder.cli import CliConfig, main, read_message, run_repl
+from firstcoder.cli import CliConfig, main, read_message, run_repl, run_single_turn
 from firstcoder.app.commands import CommandResult
 
 
@@ -335,6 +335,44 @@ def test_run_repl_routes_dream_to_command_handler_without_provider_call(capsys):
     assert commands.commands == ["/dream"]
     assert runner.turns == ["normal"]
     assert "FirstCoder> dream scheduled" in capsys.readouterr().out
+
+
+def test_run_repl_does_not_send_unknown_slash_command_to_provider(capsys):
+    """未知 slash command 也必须停在命令边界，不能变成模型问题。"""
+
+    runner = FakeChatRunner(replies=[FakeResponse("normal reply")])
+    commands = FakeCommandHandler()
+
+    run_repl(runner, ["/unknown", "normal"], command_handler=commands)
+
+    assert commands.commands == ["/unknown"]
+    assert runner.turns == ["normal"]
+    assert "Unknown command: /unknown" in capsys.readouterr().out
+
+
+def test_run_single_turn_routes_slash_command_without_provider_call(tmp_path: Path, monkeypatch) -> None:
+    """非交互单消息入口也必须把 slash command 留在命令层。"""
+
+    class SingleTurnApp:
+        def __init__(self) -> None:
+            self.command_handler = FakeCommandHandler()
+            self.chat_runner = FakeChatRunner(replies=[FakeResponse("must not run")])
+
+    app = SingleTurnApp()
+    monkeypatch.setattr(cli, "create_cli_app", lambda config: app)
+
+    output = run_single_turn(
+        CliConfig(
+            project_root=tmp_path,
+            data_root=tmp_path / ".fc",
+            session_id="single-command",
+            message="/dream",
+        )
+    )
+
+    assert output == "dream scheduled"
+    assert app.command_handler.commands == ["/dream"]
+    assert app.chat_runner.turns == []
 
 
 def test_run_repl_routes_next_line_to_pending_permission(capsys):

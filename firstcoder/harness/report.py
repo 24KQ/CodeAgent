@@ -49,4 +49,8 @@ def build_report(
             if verifier_suggestions is not None
             else getattr(task_state, "verifier_suggestions", [])
         ),
+        "harness_degraded": bool(getattr(task_state, "harness_degraded", False)),
+        "harness_degradation_reason": str(
+            getattr(task_state, "harness_degradation_reason", "") or ""
+        ),
     }

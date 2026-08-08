@@ -162,6 +162,8 @@ class AgentLoop:
             reserve_provider_call=self._reserve_provider_call,
             check_turn_timeout=self._check_turn_timeout,
             tag_task_boundary_messages=self._tag_task_boundary_messages_with_active_hash,
+            record_auxiliary_provider_request=self._record_auxiliary_provider_request,
+            record_auxiliary_provider_response=self._record_auxiliary_provider_response,
         )
         # session 创建时通常已经注册了 session-scoped 工具。这里允许调用方再传入一批
         # 测试或临时工具，但避免重复注册同名工具导致模型 schema 不稳定。
@@ -286,6 +288,59 @@ class AgentLoop:
                 error,
                 error_type=error_type,
             )
+
+    def _record_auxiliary_provider_request(self, request: ChatRequest, call_kind: str) -> str:
+        """为隐藏 provider call 生成统一 request/fingerprint 关联键。"""
+
+        request_id = new_request_id()
+        projection_fingerprint = stable_json_hash(
+            {
+                "messages": [asdict(message) for message in request.messages],
+                "tools": [asdict(definition) for definition in request.tools],
+                "tool_choice": request.tool_choice,
+                "max_tokens": request.max_tokens,
+            },
+            length=24,
+        )
+        if self.run_recorder is not None:
+            self.run_recorder.record_auxiliary_provider_requested(
+                request=request,
+                request_id=request_id,
+                projection_fingerprint=projection_fingerprint,
+                provider=self.provider,
+                call_kind=call_kind,
+            )
+        return request_id
+
+    def _record_auxiliary_provider_response(
+        self,
+        request_id: str,
+        request: ChatRequest,
+        response: ChatResponse | None,
+        error: Exception | None,
+        error_type: str,
+    ) -> None:
+        """完成隐藏请求的 evidence 配对；该回调不触碰 session history。"""
+
+        if self.run_recorder is None:
+            return
+        projection_fingerprint = stable_json_hash(
+            {
+                "messages": [asdict(message) for message in request.messages],
+                "tools": [asdict(definition) for definition in request.tools],
+                "tool_choice": request.tool_choice,
+                "max_tokens": request.max_tokens,
+            },
+            length=24,
+        )
+        self.run_recorder.record_auxiliary_provider_response(
+            request_id=request_id,
+            projection_fingerprint=projection_fingerprint,
+            provider=self.provider,
+            response=response,
+            error=error,
+            error_type=error_type,
+        )
 
     def _run_user_turn_sync(
         self,

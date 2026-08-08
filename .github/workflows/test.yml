@@ -64,11 +64,18 @@ jobs:
         run: python -m twine check dist/*
       - name: Install wheel in clean environment
         run: |
-          python -m venv "$RUNNER_TEMP/firstcoder-package"
-          "$RUNNER_TEMP/firstcoder-package/bin/python" -m pip install dist/*.whl
-          "$RUNNER_TEMP/firstcoder-package/bin/python" -m pip check
-          "$RUNNER_TEMP/firstcoder-package/bin/python" -c "import firstcoder; import firstcoder.memory.dream; import firstcoder.harness.experiments.memory_eval"
-          "$RUNNER_TEMP/firstcoder-package/bin/python" -m firstcoder --help
+          python -m venv "$RUNNER_TEMP/firstcoder-wheel"
+          "$RUNNER_TEMP/firstcoder-wheel/bin/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/firstcoder-wheel/bin/python" -m pip check
+          "$RUNNER_TEMP/firstcoder-wheel/bin/python" -c "import firstcoder; import firstcoder.memory.dream; import firstcoder.harness.experiments.memory_eval"
+          "$RUNNER_TEMP/firstcoder-wheel/bin/python" -m firstcoder --help
+      - name: Install sdist in separate clean environment
+        run: |
+          python -m venv "$RUNNER_TEMP/firstcoder-sdist"
+          "$RUNNER_TEMP/firstcoder-sdist/bin/python" -m pip install dist/*.tar.gz
+          "$RUNNER_TEMP/firstcoder-sdist/bin/python" -m pip check
+          "$RUNNER_TEMP/firstcoder-sdist/bin/python" -c "import firstcoder; import firstcoder.memory.dream; import firstcoder.harness.experiments.memory_eval"
+          "$RUNNER_TEMP/firstcoder-sdist/bin/python" -m firstcoder --help
       - name: Upload distributions
         uses: actions/upload-artifact@v4
         if: github.event_name != 'pull_request'

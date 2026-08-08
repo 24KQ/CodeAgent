@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from firstcoder.harness.run_store import RunStore
+from firstcoder.harness.ports import RunArtifactStore
 
 PHASE_BY_EVENT = {
     "run_started": "runtime",
@@ -100,7 +100,7 @@ class TraceWriter:
 
     def __init__(
         self,
-        run_store: RunStore,
+        run_store: RunArtifactStore,
         redactor: Any,
         consumers: list[TraceConsumer] | None = None,
     ) -> None:

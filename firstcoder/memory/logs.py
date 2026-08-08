@@ -38,24 +38,46 @@ def daily_lock_path(memory_dir: str | Path) -> Path:
 
 
 def ensure_memory_dir(memory_dir: str | Path) -> Path:
-    """确保 memory 目录骨架存在（logs/topics/index），缺失时原子创建。"""
+    """确保 memory 目录骨架存在，并拒绝预置的路径链接。"""
+
     memory_dir = Path(memory_dir)
+    ensure_no_link_or_junction(memory_dir)
     memory_dir.mkdir(parents=True, exist_ok=True)
-    (memory_dir / "logs").mkdir(parents=True, exist_ok=True)
-    (memory_dir / "topics").mkdir(parents=True, exist_ok=True)
+    ensure_no_link_or_junction(memory_dir)
+    for child_name in ("logs", "topics"):
+        child = memory_dir / child_name
+        child.mkdir(parents=True, exist_ok=True)
+        ensure_no_link_or_junction(child)
     index_path = memory_dir / ENTRYPOINT_NAME
+    ensure_no_link_or_junction(index_path)
     if not index_path.exists():
         atomic_write_text(index_path, _EMPTY_INDEX)
     return memory_dir
 
 
+def _daily_log_path_unlocked(memory_dir: Path, today: date) -> Path:
+    """在调用方已经持有 daily lock 时创建并检查年月目录。"""
+
+    ensure_memory_dir(memory_dir)
+    logs_dir = memory_dir / "logs"
+    ensure_no_link_or_junction(logs_dir)
+    year_dir = logs_dir / str(today.year)
+    year_dir.mkdir(parents=True, exist_ok=True)
+    ensure_no_link_or_junction(year_dir)
+    month_dir = year_dir / f"{today.month:02d}"
+    month_dir.mkdir(parents=True, exist_ok=True)
+    ensure_no_link_or_junction(month_dir)
+    return month_dir / f"{today.isoformat()}.md"
+
+
 def daily_log_path(memory_dir: str | Path, today: date | None = None) -> Path:
-    """当日日志路径：`logs/<year>/<month>/<date>.md`，父目录自动创建。"""
-    today = today or date.today()
-    memory_dir = ensure_memory_dir(memory_dir)
-    path = memory_dir / "logs" / str(today.year) / f"{today.month:02d}" / f"{today.isoformat()}.md"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+    """当日日志路径：`logs/<year>/<month>/<date>.md`，父目录在锁内创建。"""
+
+    today = today or datetime.now().astimezone().date()
+    memory_dir = Path(memory_dir)
+    ensure_no_link_or_junction(memory_dir)
+    with cross_process_lock(daily_lock_path(memory_dir)):
+        return _daily_log_path_unlocked(memory_dir, today)
 
 
 def append_to_daily_log(
@@ -64,6 +86,7 @@ def append_to_daily_log(
     today: date | None = None,
     *,
     source: MemoryEvidence | None = None,
+    quarantined: bool = False,
 ) -> Path | None:
     """追加一条带时间戳的日志行；`source` 给定时在同一把 `.daily.lock` 内
     追加当天 evidence 侧车行（原子读改写，行序与日志一致）。空 entry 返回 None。
@@ -79,13 +102,14 @@ def append_to_daily_log(
         return None
     memory_dir = Path(memory_dir)
     ensure_no_link_or_junction(memory_dir)
-    # logs 目录本身也可能被预置为 symlink/junction（Codex P2 review #3）：
-    # _transaction 只覆盖 store 写路径，这里必须覆盖 standalone/委托入口。
-    ensure_no_link_or_junction(memory_dir / "logs")
-    path = daily_log_path(memory_dir, today=today)
     timestamp = datetime.now().strftime("%H:%M")
-    evidence_path = path.with_name(path.stem + ".evidence.jsonl")
     with cross_process_lock(daily_lock_path(memory_dir)):
+        # logs 目录本身也可能被预置为 symlink/junction（Codex P2 review #3）：
+        # _transaction 只覆盖 store 写路径，这里必须覆盖 standalone/委托入口。
+        ensure_memory_dir(memory_dir)
+        ensure_no_link_or_junction(memory_dir / "logs")
+        path = _daily_log_path_unlocked(memory_dir, today or datetime.now().astimezone().date())
+        evidence_path = path.with_name(path.stem + ".evidence.jsonl")
         existing_log = path.read_text(encoding="utf-8") if path.exists() else ""
         atomic_write_bytes(path, (existing_log + f"- [{timestamp}] {entry}" + "\n").encode("utf-8"))
         if source is not None:
@@ -96,6 +120,7 @@ def append_to_daily_log(
                 "evidence_anchor_hash": source.anchor_hash,
                 "scope": source.scope,
                 "visibility": source.visibility,
+                "quarantined": bool(quarantined),
                 "at": datetime.now().astimezone().isoformat(),
             }
             existing_evidence = evidence_path.read_text(encoding="utf-8") if evidence_path.exists() else ""

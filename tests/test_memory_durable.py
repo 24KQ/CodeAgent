@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,22 @@ def test_promote_duplicate_is_skipped(tmp_path: Path) -> None:
     results, _ = store.promote([("key-decisions", "Use pytest")])
     assert results == []
     assert len(store.load_topic_notes("key-decisions")) == 1
+
+
+def test_concurrent_first_promotions_keep_all_notes(tmp_path: Path) -> None:
+    """多个线程首次初始化同一 store 时不能互相覆盖 index/topic。"""
+
+    store = _store(tmp_path)
+    texts = [f"fixture fact {index}" for index in range(8)]
+
+    def promote_text(text: str) -> tuple[list[str], list[str]]:
+        return store.promote([("key-decisions", text)])
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(promote_text, texts))
+
+    assert {note["text"] for note in store.load_topic_notes("key-decisions")} == set(texts)
+    assert store.index_version() == len(texts)
 
 
 def test_promote_supersedes_same_subject(tmp_path: Path) -> None:

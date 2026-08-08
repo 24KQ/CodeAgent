@@ -7,8 +7,15 @@ daily log 写入和 audit 由绑定 workspace 的 ``MemoryRuntime`` 统一完成
 from __future__ import annotations
 
 from firstcoder.memory.runtime import MemoryRuntime
+from firstcoder.permissions.types import PermissionAction
 from firstcoder.providers.types import ToolDefinition
-from firstcoder.tools.types import Tool, ToolResult, make_error_result, make_text_result
+from firstcoder.tools.types import (
+    Tool,
+    ToolPermissionSpec,
+    ToolResult,
+    make_error_result,
+    make_text_result,
+)
 from firstcoder.utils.schema import object_schema
 
 
@@ -101,4 +108,13 @@ def create_memory_note_tool(runtime: MemoryRuntime) -> Tool:
             parameters=parameters,
         ),
         executor=memory_note,
+        permission=ToolPermissionSpec(
+            action=PermissionAction.WRITE_PATH,
+            target_builder=lambda arguments: runtime.permission_target(
+                visibility=arguments.get("visibility", "session"),
+                include_capture=True,
+            ),
+            reason="写入当前 session memory 需要确认。",
+            allow_auto=False,
+        ),
     )

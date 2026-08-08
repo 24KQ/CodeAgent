@@ -82,6 +82,24 @@ def ensure_no_link_or_junction(path: Path) -> None:
             raise ValueError(f"memory write refused: {candidate} is a symlink/junction")
 
 
+def ensure_no_link_in_ancestors(path: Path) -> None:
+    """检查目标及其全部词法祖先，防止通用原子写入穿过链接目录。
+
+    memory 的 daily-log helper 会额外逐级检查 year/month 目录；这里是更底层的
+    纵深防御，供所有 atomic write 调用方复用。使用词法绝对路径而不调用
+    ``resolve()``，这样尚未创建的目标和已存在的链接都能在写入前被检查。
+    """
+
+    candidate = Path(path).absolute()
+    while True:
+        if _is_link_or_junction(candidate):
+            raise ValueError(f"memory write refused: {candidate} is a symlink/junction")
+        parent = candidate.parent
+        if parent == candidate:
+            return
+        candidate = parent
+
+
 class DefaultWorkspaceScope:
     """Concrete `WorkspaceScope`: memory root pinned under the workspace.
 
