@@ -37,6 +37,9 @@ def test_pytest_skip_allowlist_rejects_unknown_reason(tmp_path: Path) -> None:
     report = tmp_path / "pytest.xml"
     report.write_text(
         "<testsuite><testcase classname='x' name='known'><skipped message=\"could not import 'harbor'\" /></testcase>"
+        "<testcase classname='x' name='collection-known'><skipped message='collection skipped'>"
+        "('tests/test_harbor_adapter.py', 11, \"Skipped: could not import 'harbor': No module named 'harbor'\")"
+        "</skipped></testcase>"
         "<testcase classname='x' name='unknown'><skipped message='new environment issue' /></testcase></testsuite>",
         encoding="utf-8",
     )
@@ -44,10 +47,8 @@ def test_pytest_skip_allowlist_rejects_unknown_reason(tmp_path: Path) -> None:
     reasons = skip_reasons(report)
 
     assert is_allowed_skip(reasons[0])
+    assert is_allowed_skip(reasons[1])
     assert unexpected_skips(reasons) == ["new environment issue"]
-    assert is_allowed_skip(
-        "collection skipped Skipped: could not import 'harbor': No module named 'harbor'"
-    )
     assert is_allowed_skip("live provider requires a configured model: detail")
     assert not is_allowed_skip("known prefix was mentioned after an unrelated failure")
 

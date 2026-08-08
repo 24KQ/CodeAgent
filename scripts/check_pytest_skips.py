@@ -37,6 +37,13 @@ def skip_reasons(xml_path: Path) -> list[str]:
             continue
         message = str(skipped.attrib.get("message") or "").strip()
         body = " ".join((skipped.text or "").split())
+        # pytest 对 collection 阶段的 skip 会把文件、行号和真正原因包装成
+        # 元组；提取其中的 ``Skipped:`` 片段，才能按实际原因而不是路径分类。
+        if message.casefold() == "collection skipped":
+            marker = "skipped:"
+            marker_index = body.casefold().find(marker)
+            if marker_index >= 0:
+                body = body[marker_index:]
         reasons.append(" ".join(part for part in (message, body) if part) or "<missing reason>")
     return reasons
 
