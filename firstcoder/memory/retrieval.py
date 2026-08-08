@@ -24,22 +24,80 @@ from typing import Any
 
 from firstcoder.memory.durable import DurableMemoryStore, note_id_for
 from firstcoder.memory.models import (
+    MEMORY_VISIBILITIES,
     MemoryEvidence,
     MemoryNote,
     MemoryQuery,
-    MEMORY_VISIBILITIES,
     RetrievalResult,
     RetrievalSelection,
 )
 from firstcoder.memory.provenance import workspace_fingerprint
 
+_MEMORY_STOP_WORDS = frozenset(
+    {
+        # 完整 AgentLoop user message 可能包含评估说明或自然语言连接词；
+        # 这些词不能单独证明 durable note 与当前问题相关。
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "been",
+        "being",
+        "by",
+        "do",
+        "for",
+        "from",
+        "if",
+        "in",
+        "is",
+        "it",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "this",
+        "to",
+        "was",
+        "were",
+        "with",
+        "you",
+        "your",
+        "的",
+        "了",
+        "和",
+        "与",
+        "或",
+        "是",
+        "在",
+        "有",
+        "无",
+        "我",
+        "你",
+        "这",
+        "那",
+        "不",
+        "未",
+        "请",
+        "只",
+        "需",
+        "要",
+    }
+)
 
-def _tokenize(text: str) -> set[str]:
-    """分词：ASCII 词 + 中文连续块按 bigram 切分（Codex P2 review #6）。
+
+def tokenize_memory_text(text: str, *, remove_stop_words: bool = True) -> set[str]:
+    """分词：ASCII 词 + 中文连续块按 bigram 切分，可选去掉低信号词。
 
     连续中文整段作一个 token 时，query 子串（如"测试" vs 笔记里的
     "单元测试"）无法重叠召回；按 2-gram 切分让子串匹配成为可能。
-    单字块保留原字（"是"等虚词可能带来少量假重叠，可接受）。
+    English/中文停用词只作为连接语法，不能单独触发 memory 命中；保留
+    ``pytest``、``memory`` 等领域词，使短的直接 query 和 exact tag 仍然有效。
+    评估器在期望答案完全由停用词组成的边界 case 中可以关闭过滤，但普通
+    Retriever 必须保留默认过滤，避免完整 AgentLoop prompt 产生低信号命中。
     """
     raw = str(text)
     tokens = {token.lower() for token in re.findall(r"[A-Za-z0-9_]+", raw)}
@@ -49,7 +107,15 @@ def _tokenize(text: str) -> set[str]:
         else:
             for i in range(len(block) - 1):
                 tokens.add(block[i : i + 2])
-    return tokens
+    if not remove_stop_words:
+        return tokens
+    return {token for token in tokens if token not in _MEMORY_STOP_WORDS}
+
+
+def _tokenize(text: str) -> set[str]:
+    """保留旧的模块内名称，统一转发到带低信号过滤的 tokenizer。"""
+
+    return tokenize_memory_text(text)
 
 
 def _parse_timestamp(value: str) -> float:
@@ -226,11 +292,15 @@ class MemoryRetriever:
         *,
         include_global: bool = False,
     ) -> list[tuple[tuple[int, int, float, int], float, dict]]:
-        query_tokens = _tokenize(query)
+        query_tokens = tokenize_memory_text(query)
         ranked = []
         for note in self._iter_notes(include_global=include_global):
             note_tags = {tag.lower() for tag in note.get("tags", [])}
-            note_tokens = _tokenize(note.get("text", "")) | _tokenize(note.get("source", "")) | note_tags
+            note_tokens = (
+                tokenize_memory_text(note.get("text", ""))
+                | tokenize_memory_text(note.get("source", ""))
+                | note_tags
+            )
             exact_tag_match = int(bool(query_tokens & note_tags))
             keyword_overlap = len(query_tokens & note_tokens)
             if exact_tag_match == 0 and keyword_overlap == 0:

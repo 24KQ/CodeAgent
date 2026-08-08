@@ -205,6 +205,46 @@ def test_empty_memory_projection_records_abstention_audit_for_real_query(tmp_pat
     assert evaluated["associations"][0]["projection_empty"] is True
 
 
+def test_agent_loop_does_not_project_generic_build_note_for_full_evaluation_prompt(
+    tmp_path: Path,
+) -> None:
+    """真实 AgentLoop 查询包含评估说明时，低信号词不能命中无关 durable note。"""
+
+    session = _session(tmp_path, session_id="full-evaluation-prompt")
+    session.memory_runtime.promote(
+        "project-conventions",
+        "build tool for this project is uv",
+        source="test",
+    )
+    provider = _FixtureProvider(
+        [
+            ChatResponse(
+                provider="fixture",
+                model="fixture-model",
+                content="unknown",
+                finish_reason="stop",
+            )
+        ]
+    )
+    prompt = (
+        "You are evaluating a durable-memory assistant. Use only relevant durable "
+        "memory provided in the context. Do not guess. If evidence is missing, say "
+        "that you cannot determine the answer. Question: unknown production incident case-04"
+    )
+
+    result = AgentLoop(session=session, provider=provider)._run_user_turn_sync(prompt)
+
+    assert result.response is not None
+    events = [
+        event
+        for event in session.store.list_events(session.session_id)
+        if event.type == "memory_retrieved"
+    ]
+    assert len(events) == 1
+    assert events[0].payload["selected_note_ids"] == []
+    assert events[0].payload["projection_empty"] is True
+
+
 def test_provider_error_trace_keeps_request_correlation_keys(tmp_path: Path) -> None:
     """provider 失败的 model_parsed 也必须暴露统一的顶层关联键。"""
 
