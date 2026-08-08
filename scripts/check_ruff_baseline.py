@@ -45,7 +45,7 @@ def _relative_filename(filename: str) -> str:
     lowered = normalized.casefold()
     for prefix in ("firstcoder/", "tests/", "scripts/"):
         marker = "/" + prefix
-        index = lowered.find(marker)
+        index = lowered.rfind(marker)
         if index >= 0:
             return normalized[index + 1 :]
         if lowered.startswith(prefix):
