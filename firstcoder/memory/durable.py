@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Iterator
 
 from firstcoder.memory.logs import ENTRYPOINT_NAME, append_to_daily_log, daily_lock_path, ensure_memory_dir
-from firstcoder.memory.models import MEMORY_VISIBILITIES, MemoryEvidence, MemoryNote
+from firstcoder.memory.models import MEMORY_VISIBILITIES, MemoryEvidence, MemoryNote, NoteStatus
 from firstcoder.memory.paths import ensure_no_link_or_junction, validate_memory_root
 from firstcoder.memory.provenance import (
     apply_evidence_staleness,
@@ -453,7 +453,12 @@ class DurableMemoryStore:
 
     # --- 写操作 --------------------------------------------------------------
 
-    def promote(self, promotions: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
+    def promote(
+        self,
+        promotions: list[tuple[str, str]],
+        *,
+        requested_status: NoteStatus | None = None,
+    ) -> tuple[list[str], list[str]]:
         """把 (topic, note_text) 提升为 durable 笔记，返回 (results, superseded)。
 
         一致性模型（recovery-on-read，M3 版本号/CAS；Codex P2 review #1
@@ -471,6 +476,10 @@ class DurableMemoryStore:
         - 崩溃（进程被杀）可能留下已写但未注册的 topic/metadata：已注册
           topic 的新内容立即可读，新 topic 等下一次 promote（含重复 note）
           把 index 补发到最新版本后可见（自愈）。
+
+        ``requested_status`` 只用于契约层已经明确标记状态的单条写入：
+        ``quarantined`` 和 ``superseded`` 只能收紧状态，不能让调用方把
+        文本安全检查放宽；``active`` 不会改变默认推导行为。
         """
         if not promotions:
             return [], []
@@ -506,8 +515,13 @@ class DurableMemoryStore:
                 # quarantine 判定先于 supersession（Codex P2 review #7）：
                 # 恶意/secret-shaped 新笔记不得先把有效旧笔记标记 superseded
                 # 再把自己隔离——那会让旧记忆不可检索。
-                quarantined = should_quarantine(note_text)
-                new_subject = None if quarantined else self._subject_key(note_text)
+                # 文本规则是默认隔离门；契约层显式 quarantined 只能额外收紧
+                # 状态，且必须在 subject supersession 之前生效，避免一条不含
+                # secret 形状的 fixture note 先替换掉仍然有效的旧记忆。显式
+                # superseded 也不是新的 active 事实，因此同样不能触发替换。
+                quarantined = requested_status == "quarantined" or should_quarantine(note_text)
+                inactive = quarantined or requested_status == "superseded"
+                new_subject = None if inactive else self._subject_key(note_text)
                 replaced = False
                 supersedes = None
                 if new_subject:
@@ -525,8 +539,14 @@ class DurableMemoryStore:
                 if not replaced:
                     existing.append(note_text)
                 new_meta = self._metadata_for_note(topic, note_text, metadata)
-                new_meta["status"] = "quarantined" if quarantined else "active"
-                new_meta["supersedes"] = None if quarantined else supersedes
+                new_meta["status"] = (
+                    "quarantined"
+                    if quarantined
+                    else "superseded"
+                    if requested_status == "superseded"
+                    else "active"
+                )
+                new_meta["supersedes"] = None if inactive else supersedes
                 metadata[new_meta["note_id"]] = new_meta
                 results.append(f"{topic}: {note_text}")
             # 写顺序：metadata/topic 先落盘，index 最后发布为提交点。
@@ -602,15 +622,20 @@ class DurableMemoryStore:
     def upsert_topic(self, note: MemoryNote) -> None:
         """按契约形状的单一笔记写入（promote 的面向契约入口）。
 
-        quarantine 判定由 promote 统一负责（与 pico 语义一致）：
-        这里只补 evidence / supersedes，不覆盖 status。
+        quarantine 判定由 promote 统一负责（与 pico 语义一致）；契约层显式
+        ``quarantined``/``superseded`` 通过同一判定点传递。这里补 evidence /
+        supersedes，且对重复 note 再保持显式收紧状态；其他 status 不得覆盖
+        安全判定。
         """
         requested_visibility = self._check_visibility(note.evidence.visibility)
         if note.evidence.scope == "global":
             requested_visibility = "global"
         if self.global_store and requested_visibility != "global":
             raise ValueError("global memory store accepts only global notes")
-        self.promote([(note.topic, note.text)])
+        self.promote(
+            [(note.topic, note.text)],
+            requested_status=note.status,
+        )
         self._apply_note_metadata(note)
 
     def _apply_note_metadata(self, note: MemoryNote) -> None:
@@ -625,6 +650,14 @@ class DurableMemoryStore:
             row = metadata.get(note_id_for(note.topic, _fold_note_text(note.text)))
             if row is None:
                 return
+            # 状态更新只能单向收紧：显式 quarantined 必须覆盖此前 active
+            # 的重复 note；显式 superseded 可以隐藏 active 旧事实，但不能
+            # 反向解除文本规则或历史已确认的 quarantine，防止调用方借
+            # MemoryNote.status 绕过安全门。
+            if note.status == "quarantined":
+                row["status"] = "quarantined"
+            elif note.status == "superseded" and row.get("status") != "quarantined":
+                row["status"] = "superseded"
             if note.evidence.session_id or note.evidence.source_path or note.evidence.scope:
                 evidence = dict(row.get("evidence") or {})
                 if note.evidence.session_id:
