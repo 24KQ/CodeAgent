@@ -8,6 +8,7 @@ from typing import Protocol
 
 from firstcoder.agent.loop_limits import AgentLoopLimits
 from firstcoder.app.commands import ContextCommandHandler
+from firstcoder.app.dream_commands import DreamCommandHandler
 from firstcoder.app.help_commands import HelpCommandHandler
 from firstcoder.app.mcp_commands import McpCommandHandler
 from firstcoder.app.model_commands import ModelCommandHandler, ModelState
@@ -31,6 +32,11 @@ from firstcoder.mcp.manager import McpManager
 from firstcoder.mcp.models import McpServerStatus, McpToolDescription
 from firstcoder.mcp.search import McpSearchEntry, create_mcp_tool_search
 from firstcoder.providers.base import ChatProvider
+from firstcoder.memory.dream.scheduler import (
+    MemoryMaintenanceConfig,
+    MemoryMaintenanceScheduler,
+    ProviderBoundedDreamRunner,
+)
 from firstcoder.providers.factory import (
     ProviderConfigError,
     create_provider_for_model,
@@ -233,6 +239,25 @@ def create_firstcoder_app(
         context_window=selected_profile.context_window if selected_profile is not None else None,
         background_manager=background_manager,
     )
+    memory_config = resolved_app_config.memory_config()
+    maintenance_config = MemoryMaintenanceConfig(
+        enabled=memory_config.auto_dream,
+        min_interval_hours=memory_config.dream_interval_hours,
+        min_sessions=memory_config.dream_min_sessions,
+    )
+    memory_scheduler = MemoryMaintenanceScheduler(
+        workspace_root=project_path,
+        memory_store=session.memory_store,
+        sessions_dir=store.sessions_dir,
+        runner=ProviderBoundedDreamRunner(
+            lambda: chat_runner.provider,
+            max_tokens=maintenance_config.provider_max_tokens,
+        ),
+        config=maintenance_config,
+    )
+    # scheduler 是 workspace 级旁路服务；chat runner 只持有它的窄触发接口，
+    # 因而普通 turn 不会在主 agent loop 内嵌套第二个 runtime。
+    chat_runner.memory_scheduler = memory_scheduler
     context_handler = ContextCommandHandler(
         session=current,
         context_manager=context_manager,
@@ -253,6 +278,7 @@ def create_firstcoder_app(
             session_handler,
             context_handler,
             MemoryCommandHandler(session=current),
+            DreamCommandHandler(session=current, scheduler=memory_scheduler),
             permission_handler,
             skill_handler,
         ]
@@ -267,8 +293,17 @@ def create_firstcoder_app(
             provider_model=resolved_provider.model,
             project_name=project_path.resolve().name,
         ),
-        on_shutdown=mcp_manager.close,
+        on_shutdown=lambda: _close_app_services(memory_scheduler, mcp_manager),
     )
+
+
+def _close_app_services(memory_scheduler: MemoryMaintenanceScheduler, mcp_manager: McpManagerLike) -> None:
+    """以幂等顺序关闭 P6 scheduler 和 MCP 后台资源。"""
+
+    try:
+        memory_scheduler.close()
+    finally:
+        mcp_manager.close()
 
 
 def _should_use_streaming(provider: ChatProvider, config: AppConfig) -> bool:

@@ -19,6 +19,7 @@ from firstcoder.memory.models import (
     PromotionCandidate,
     RetrievalResult,
 )
+from firstcoder.memory.dream.models import DreamProposal, MemoryMaintenanceSnapshot
 
 
 class MemoryStorePort(Protocol):
@@ -30,6 +31,7 @@ class MemoryStorePort(Protocol):
 
     def append_daily_log(self, text: str, *, source: MemoryEvidence | None = None) -> Path | None: ...
     def upsert_topic(self, note: MemoryNote) -> None: ...
+    def promote_maintenance(self, notes: list[MemoryNote]) -> tuple[list[str], list[str]]: ...
     def read_index(self) -> list[MemoryNote]: ...
 
 
@@ -68,4 +70,10 @@ class WorkspaceScope(Protocol):
 class BoundedDreamRunner(Protocol):
     """Bounded LLM maintenance runner with a restricted write scope."""
 
-    def run_maintenance(self, *, write_scope: WorkspaceScope) -> None: ...
+    def run_maintenance(
+        self,
+        *,
+        prompt: str,
+        snapshot: MemoryMaintenanceSnapshot,
+        write_scope: WorkspaceScope,
+    ) -> DreamProposal: ...

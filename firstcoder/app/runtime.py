@@ -26,6 +26,7 @@ from firstcoder.context.runtime_state import SessionRuntimeState
 from firstcoder.input.attachments import UserAttachment
 from firstcoder.memory.prompt import MemoryProjector
 from firstcoder.memory.runtime import MemoryRuntime
+from firstcoder.memory.dream.scheduler import MemoryMaintenanceScheduler
 from firstcoder.permissions.types import PermissionMode
 from firstcoder.providers.base import ChatProvider
 from firstcoder.providers.types import ChatResponse, ChatStreamEvent, MainRequestOptions
@@ -34,6 +35,21 @@ from firstcoder.runtime.user_input import UserInputRequest
 from firstcoder.tools.hidden import HIDDEN_TOOL_STATUS_NAMES
 from firstcoder.tools.types import Tool
 from firstcoder.utils.text import ellipsis_truncate
+
+_NON_SUCCESSFUL_MAINTENANCE_FINISH_REASONS = frozenset(
+    {
+        "error",
+        "interrupted",
+        "provider_call_limit",
+        "retry_limit",
+        "retry_limit_reached",
+        "tool_round_limit",
+        "turn_timeout",
+        "length",
+        "content_filter",
+        "unknown",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -108,6 +124,9 @@ class AgentChatRunner:
     stream_event_handler: Callable[[ChatStreamEvent], None] | None = None
     tool_event_handler: Callable[[ToolExecutionEvent], None] | None = None
     background_manager: BackgroundJobManager | None = None
+    # memory scheduler 与当前 session 共享 workspace store，但不参与主 turn 的
+    # provider/tool 编排；它只在主 turn 已经成功落库后接收一次非阻塞触发。
+    memory_scheduler: MemoryMaintenanceScheduler | None = None
     pending_guidance: list[str] = field(default_factory=list)
     _guidance_lock: threading.Lock = field(default_factory=threading.Lock)
     _cancellation_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -274,8 +293,29 @@ class AgentChatRunner:
         if result.response is not None:
             if result.response.content and not self.last_display_lines:
                 self.last_display_lines.append(result.response.content)
+            if (
+                result.status == AgentTurnStatus.COMPLETED
+                and result.pending_input is None
+                and _is_successful_maintenance_turn(result.response)
+            ):
+                self._maybe_schedule_memory_maintenance()
             return result.response
         return self._waiting_for_input_response(result.pending_input)
+
+    def _maybe_schedule_memory_maintenance(self) -> None:
+        """在普通 turn 收口后触发 P6，并隔离 scheduler 对主回答的影响。
+
+        AgentLoop 已经在返回 ``AgentTurnResult`` 前追加 assistant 事件，因此这里
+        是“持久化成功后”的最外层收口。权限等待没有最终回答，不会触发；scheduler
+        内部只提交后台任务，provider 或 durable 失败也不能改写用户已经看到的回答。
+        """
+
+        if self.memory_scheduler is None:
+            return
+        try:
+            self.memory_scheduler.maybe_schedule(self.current_session.session_id)
+        except Exception:  # noqa: BLE001 - 维护旁路不能破坏主聊天结果
+            return
 
     def _current_tools(self) -> list[Tool] | None:
         """Resolve tools once per loop so the session registry sees that same list."""
@@ -319,6 +359,12 @@ class AgentChatRunner:
         if response.content:
             self.last_display_lines.append(response.content)
         return response
+
+
+def _is_successful_maintenance_turn(response: ChatResponse | None) -> bool:
+    """只允许真实最终回答触发 auto-dream，排除 loop 合成的失败/中断文本。"""
+
+    return response is not None and str(response.finish_reason or "") not in _NON_SUCCESSFUL_MAINTENANCE_FINISH_REASONS
 
 
 def _display_lines_from_messages(messages: list[AgentMessage]) -> list[str]:

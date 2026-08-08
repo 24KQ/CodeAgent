@@ -155,7 +155,11 @@ class DurableMemoryStore:
         写前守卫：root/topics/logs 目录若被预置为 symlink/junction，原子
         写会被导向 workspace 外（Codex P2 review #1，P1 项）——拒绝写入。
         """
+        # root 本身也可能在 store 创建后被替换成链接；先检查 root，再创建
+        # topics/logs，避免只检查子目录却已经沿着 root 重解析点越界。
+        ensure_no_link_or_junction(self.root)
         ensure_memory_dir(self.root)
+        ensure_no_link_or_junction(self.root)
         ensure_no_link_or_junction(self.root / "topics")
         ensure_no_link_or_junction(self.root / "logs")
         with cross_process_lock(self.lock_path):
@@ -484,76 +488,157 @@ class DurableMemoryStore:
         if not promotions:
             return [], []
         with self._transaction():
-            topics = {topic["topic"]: topic for topic in self._load_index_unlocked()}
-            topic_notes = {
-                slug: [note["text"] for note in self._load_topic_notes_unlocked(slug)] for slug in topics
-            }
-            topic_metadata = {slug: self._load_topic_metadata(slug) for slug in topics}
-            results = []
-            superseded = []
-            for topic, note_text in promotions:
-                topic = self._check_topic_slug(topic)
-                # 多行 note 折叠为单行：note_id 必须基于折叠后的文本
-                # （与 `_apply_note_metadata` 共用同一 helper，见该函数）。
-                note_text = _fold_note_text(note_text)
-                if not note_text:
-                    continue
-                meta = DURABLE_TOPIC_DEFAULTS[topic]
-                topics.setdefault(
-                    topic,
-                    {
-                        "topic": topic,
-                        "title": meta["title"],
-                        "summary": meta["summary"],
-                        "tags": list(meta["tags"]),
-                    },
+            return self._promote_unlocked(promotions, requested_status=requested_status)
+
+    def promote_maintenance(self, notes: list[MemoryNote]) -> tuple[list[str], list[str]]:
+        """在一个 durable 事务中提交 auto-dream 的 workspace 候选。
+
+        P6 runner 的结果必须先变成 ``MemoryNote``，再经过这个入口。它拒绝
+        global visibility、global store 和 workspace 外 evidence，之后复用普通
+        ``promote`` 的 quarantine、subject supersession、topic/metadata/index
+        发布顺序。这样维护任务不会拥有一套绕过 P2 安全边界的写盘实现。
+        """
+
+        if self.global_store:
+            raise ValueError("auto-dream maintenance cannot write a global store")
+        if not notes:
+            return [], []
+
+        promotions: list[tuple[str, str]] = []
+        evidence_by_note_id: dict[str, MemoryEvidence] = {}
+        for note in notes:
+            visibility = self._check_visibility(note.evidence.visibility)
+            if visibility != "workspace":
+                raise ValueError("auto-dream maintenance candidates must use workspace visibility")
+            topic = self._check_topic_slug(note.topic)
+            if topic not in DURABLE_TOPIC_DEFAULTS:
+                raise ValueError(f"maintenance topic {topic!r} is not a durable topic")
+            text = _fold_note_text(note.text)
+            if not text:
+                continue
+            if note.evidence.scope not in {"", "workspace", self._scope()}:
+                raise ValueError("auto-dream maintenance candidate has a mismatched workspace scope")
+            if note.evidence.source_path:
+                resolved_source = source_path_for_evidence(
+                    self.workspace_root,
+                    note.evidence.source_path,
                 )
-                existing = topic_notes.setdefault(topic, [])
-                metadata = topic_metadata.setdefault(topic, {})
-                if note_text in existing:
-                    continue
-                # quarantine 判定先于 supersession（Codex P2 review #7）：
-                # 恶意/secret-shaped 新笔记不得先把有效旧笔记标记 superseded
-                # 再把自己隔离——那会让旧记忆不可检索。
-                # 文本规则是默认隔离门；契约层显式 quarantined 只能额外收紧
-                # 状态，且必须在 subject supersession 之前生效，避免一条不含
-                # secret 形状的 fixture note 先替换掉仍然有效的旧记忆。显式
-                # superseded 也不是新的 active 事实，因此同样不能触发替换。
-                quarantined = requested_status == "quarantined" or should_quarantine(note_text)
-                inactive = quarantined or requested_status == "superseded"
-                new_subject = None if inactive else self._subject_key(note_text)
-                replaced = False
-                supersedes = None
-                if new_subject:
-                    for index, old_text in enumerate(list(existing)):
-                        if self._subject_key(old_text) == new_subject:
-                            superseded.append(f"{topic}: {old_text} -> {note_text}")
-                            old_id = note_id_for(topic, old_text)
-                            old_meta = self._metadata_for_note(topic, old_text, metadata)
-                            old_meta["status"] = "superseded"
-                            metadata[old_id] = old_meta
-                            supersedes = old_id
-                            existing[index] = note_text
-                            replaced = True
-                            break
-                if not replaced:
-                    existing.append(note_text)
-                new_meta = self._metadata_for_note(topic, note_text, metadata)
-                new_meta["status"] = (
-                    "quarantined"
-                    if quarantined
-                    else "superseded"
-                    if requested_status == "superseded"
-                    else "active"
-                )
-                new_meta["supersedes"] = None if inactive else supersedes
-                metadata[new_meta["note_id"]] = new_meta
-                results.append(f"{topic}: {note_text}")
-            # 写顺序：metadata/topic 先落盘，index 最后发布为提交点。
-            for topic, notes in topic_notes.items():
-                self._write_topic(topic, notes, metadata=topic_metadata.get(topic, {}))
-            self._write_index([topics[slug] for slug in sorted(topics)], self._index_version_unlocked() + 1)
-            return results, superseded
+                if resolved_source is None:
+                    raise ValueError("auto-dream maintenance evidence is outside the workspace")
+            promotions.append((topic, text))
+            evidence_by_note_id[note_id_for(topic, text)] = note.evidence
+
+        if not promotions:
+            return [], []
+        with self._transaction():
+            return self._promote_unlocked(
+                promotions,
+                evidence_by_note_id=evidence_by_note_id,
+            )
+
+    def _promote_unlocked(
+        self,
+        promotions: list[tuple[str, str]],
+        *,
+        requested_status: NoteStatus | None = None,
+        evidence_by_note_id: dict[str, MemoryEvidence] | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """在调用方已经持有 store lock 时执行通用提升。"""
+
+        evidence_by_note_id = evidence_by_note_id or {}
+        topics = {topic["topic"]: topic for topic in self._load_index_unlocked()}
+        topic_notes = {
+            slug: [note["text"] for note in self._load_topic_notes_unlocked(slug)] for slug in topics
+        }
+        topic_metadata = {slug: self._load_topic_metadata(slug) for slug in topics}
+        results = []
+        superseded = []
+        for topic, note_text in promotions:
+            topic = self._check_topic_slug(topic)
+            # 多行 note 折叠为单行：note_id 必须基于折叠后的文本
+            # （与 `_apply_note_metadata` 共用同一 helper，见该函数）。
+            note_text = _fold_note_text(note_text)
+            if not note_text:
+                continue
+            meta = DURABLE_TOPIC_DEFAULTS[topic]
+            topics.setdefault(
+                topic,
+                {
+                    "topic": topic,
+                    "title": meta["title"],
+                    "summary": meta["summary"],
+                    "tags": list(meta["tags"]),
+                },
+            )
+            existing = topic_notes.setdefault(topic, [])
+            metadata = topic_metadata.setdefault(topic, {})
+            if note_text in existing:
+                continue
+            # quarantine 判定先于 supersession（Codex P2 review #7）：
+            # 恶意/secret-shaped 新笔记不得先把有效旧笔记标记 superseded
+            # 再把自己隔离——那会让旧记忆不可检索。
+            # 文本规则是默认隔离门；契约层显式 quarantined 只能额外收紧
+            # 状态，且必须在 subject supersession 之前生效，避免一条不含
+            # secret 形状的 fixture note 先替换掉仍然有效的旧记忆。显式
+            # superseded 也不是新的 active 事实，因此同样不能触发替换。
+            quarantined = requested_status == "quarantined" or should_quarantine(note_text)
+            inactive = quarantined or requested_status == "superseded"
+            new_subject = None if inactive else self._subject_key(note_text)
+            replaced = False
+            supersedes = None
+            if new_subject:
+                for index, old_text in enumerate(list(existing)):
+                    if self._subject_key(old_text) == new_subject:
+                        superseded.append(f"{topic}: {old_text} -> {note_text}")
+                        old_id = note_id_for(topic, old_text)
+                        old_meta = self._metadata_for_note(topic, old_text, metadata)
+                        old_meta["status"] = "superseded"
+                        metadata[old_id] = old_meta
+                        supersedes = old_id
+                        existing[index] = note_text
+                        replaced = True
+                        break
+            if not replaced:
+                existing.append(note_text)
+            new_meta = self._metadata_for_note(topic, note_text, metadata)
+            evidence = evidence_by_note_id.get(new_meta["note_id"])
+            if evidence is not None:
+                new_meta = self._merge_note_evidence(new_meta, evidence)
+            new_meta["status"] = (
+                "quarantined"
+                if quarantined
+                else "superseded"
+                if requested_status == "superseded"
+                else "active"
+            )
+            new_meta["supersedes"] = None if inactive else supersedes
+            metadata[new_meta["note_id"]] = new_meta
+            results.append(f"{topic}: {note_text}")
+        # 写顺序：metadata/topic 先落盘，index 最后发布为提交点。
+        for topic, notes in topic_notes.items():
+            self._write_topic(topic, notes, metadata=topic_metadata.get(topic, {}))
+        self._write_index([topics[slug] for slug in sorted(topics)], self._index_version_unlocked() + 1)
+        return results, superseded
+
+    @staticmethod
+    def _merge_note_evidence(row: dict, evidence: MemoryEvidence) -> dict:
+        """把维护候选的 provenance 合并到已由 store 创建的 metadata 行。"""
+
+        merged = dict(row)
+        stored_evidence = dict(merged.get("evidence") or {})
+        if evidence.session_id:
+            stored_evidence["session_id"] = evidence.session_id
+        if evidence.source_path:
+            stored_evidence["source_path"] = evidence.source_path
+        if evidence.anchor_hash:
+            stored_evidence["evidence_anchor_hash"] = evidence.anchor_hash
+        if not stored_evidence.get("evidence_anchor_hash"):
+            stored_evidence["evidence_anchor_hash"] = ""
+        merged["evidence"] = stored_evidence
+        if evidence.scope and evidence.scope != "workspace":
+            merged["scope"] = evidence.scope
+        merged["visibility"] = "workspace"
+        return merged
 
     def _write_topic(self, topic: str, notes: list[str], metadata: dict | None = None) -> None:
         ensure_memory_dir(self.root)

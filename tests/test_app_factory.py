@@ -162,6 +162,39 @@ def test_create_firstcoder_app_wires_session_commands_context_and_chat(tmp_path:
     assert "项目规则" in provider.requests[0].messages[0].content
 
 
+def test_factory_wires_manual_dream_to_workspace_scheduler_without_session_history(tmp_path: Path) -> None:
+    """工厂注册的 ``/dream`` 使用真实 scheduler，但 audit 不进入 session JSONL。"""
+
+    provider = FakeProvider(
+        [
+            ChatResponse(
+                provider="fake",
+                model="fake-model",
+                content='{"candidates": [], "rejections": [], "relative_dates_absolutized": 0}',
+            )
+        ]
+    )
+    app = create_firstcoder_app(
+        project_root=tmp_path,
+        data_root=tmp_path / ".firstcoder",
+        provider=provider,
+        session_id="sess_dream_factory",
+        tools=[],
+    )
+
+    result = app.command_handler.handle("/dream")
+    assert result.handled is True
+    scheduler = app.chat_runner.memory_scheduler
+    assert scheduler is not None
+    scheduler.wait_for_idle(timeout=5)
+    state = scheduler.state_store.load()
+    assert state is not None
+    assert state.status == "succeeded"
+    event_types = [event.type for event in app.current_session.session.store.list_events("sess_dream_factory")]
+    assert event_types == ["session_created"]
+    app.on_unmount()
+
+
 def test_create_firstcoder_app_wires_new_fork_and_skill_commands(tmp_path: Path) -> None:
     skills_dir = tmp_path / "skills"
     skills_dir.mkdir()

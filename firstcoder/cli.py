@@ -1,7 +1,7 @@
 """Command-line entry point for single-turn FirstCoder runs."""
 
 from __future__ import annotations
-from firstcoder.app.ports import ChatRunnerLike
+from firstcoder.app.ports import ChatRunnerLike, CommandHandlerLike
 
 import argparse
 import sys
@@ -140,7 +140,15 @@ def main(
         try:
             app = create_cli_app(config)
             lines = stdin_text.splitlines() if stdin_text is not None else None
-            run_repl(app.chat_runner, lines, auto_approve=args.auto_approve)
+            try:
+                run_repl(
+                    app.chat_runner,
+                    lines,
+                    auto_approve=args.auto_approve,
+                    command_handler=app.command_handler,
+                )
+            finally:
+                _close_cli_app(app)
         except Exception as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -177,20 +185,34 @@ def run_single_turn(config: CliConfig) -> str:
     if config.benchmark:
         return run_benchmark_turn(config)
     app = create_cli_app(config)
-    response = app.chat_runner.run_user_turn(config.message)
-    return response.content
+    try:
+        response = app.chat_runner.run_user_turn(config.message)
+        return response.content
+    finally:
+        _close_cli_app(app)
 
 
 def run_benchmark_turn(config: CliConfig) -> str:
     """Run Harbor's non-interactive turn with benchmark-safe session settings."""
 
     app = create_cli_app(config)
-    app.current_session.set_permission_mode(PermissionMode.BYPASS)
-    app.current_session.session.require_prewrite_review = False
-    app.current_session.session.set_benchmark_task(config.message)
-    app.chat_runner.limits = _benchmark_limits(config.max_tool_rounds)
-    response = app.chat_runner.run_user_turn(config.message)
-    return response.content
+    try:
+        app.current_session.set_permission_mode(PermissionMode.BYPASS)
+        app.current_session.session.require_prewrite_review = False
+        app.current_session.session.set_benchmark_task(config.message)
+        app.chat_runner.limits = _benchmark_limits(config.max_tool_rounds)
+        response = app.chat_runner.run_user_turn(config.message)
+        return response.content
+    finally:
+        _close_cli_app(app)
+
+
+def _close_cli_app(app: object) -> None:
+    """关闭真实 TUI app 的旁路资源，同时兼容 CLI 单测的最小 fake app。"""
+
+    close = getattr(app, "on_unmount", None)
+    if callable(close):
+        close()
 
 
 def create_cli_app(config: CliConfig):
@@ -368,6 +390,7 @@ def run_repl(
     lines: Iterable[str] | None = None,
     *,
     auto_approve: bool = False,
+    command_handler: CommandHandlerLike | None = None,
 ) -> None:
     source = iter(lines) if lines is not None else _stdin_lines()
     pending = None
@@ -389,6 +412,14 @@ def run_repl(
                 line = choice
             response = chat_runner.resume_with_user_input(_pending_id(pending), line)
         else:
+            # 只有没有待处理用户输入时才拦截维护命令；权限确认期间的每一行
+            # 都属于对 pending request 的回答，不能被旁路命令吞掉。
+            # TUI 则由同一个 CompositeCommandHandler 在自己的 pending 边界处理。
+            if command_handler is not None and (line == "/dream" or line.startswith("/dream ")):
+                result = command_handler.handle(line)
+                if result.handled:
+                    print(f"FirstCoder> {result.output}")
+                    continue
             response = chat_runner.run_user_turn(line)
 
         print(f"FirstCoder> {response.content}")
