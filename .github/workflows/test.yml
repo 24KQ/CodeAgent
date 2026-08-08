@@ -1,12 +1,28 @@
-name: Tests
+name: Quality
 
 on:
   pull_request:
   push:
     branches: [main]
+  workflow_call:
 
 jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install package and lint tool
+        run: python -m pip install -e ".[dev]"
+      - name: Check Ruff baseline
+        run: python scripts/check_ruff_baseline.py
+
   test:
+    name: test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -21,4 +37,34 @@ jobs:
       - name: Install package
         run: python -m pip install -e ".[dev]"
       - name: Run tests
-        run: python -m pytest -q
+        run: python -m pytest -q -ra --junitxml="$RUNNER_TEMP/pytest-${{ matrix.python-version }}.xml"
+      - name: Validate skipped tests
+        run: python scripts/check_pytest_skips.py "$RUNNER_TEMP/pytest-${{ matrix.python-version }}.xml"
+
+  package-smoke:
+    name: package-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install packaging tools
+        run: python -m pip install --upgrade build twine
+      - name: Build distributions
+        run: python -m build --sdist --wheel
+      - name: Validate distribution metadata
+        run: python -m twine check dist/*
+      - name: Install wheel in clean environment
+        run: |
+          python -m venv "$RUNNER_TEMP/firstcoder-package"
+          "$RUNNER_TEMP/firstcoder-package/bin/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/firstcoder-package/bin/python" -m pip check
+          "$RUNNER_TEMP/firstcoder-package/bin/python" -c "import firstcoder; import firstcoder.memory.dream; import firstcoder.harness.experiments.memory_eval"
+          "$RUNNER_TEMP/firstcoder-package/bin/python" -m firstcoder --help
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: firstcoder-dist
+          path: dist/*
+          if-no-files-found: error

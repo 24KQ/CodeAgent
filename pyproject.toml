@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "ruff==0.16.0"]
 
 [project.scripts]
 firstcoder = "firstcoder.cli:main"
