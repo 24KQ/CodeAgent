@@ -51,6 +51,19 @@ LIVE_ARTIFACT_DIR_ENV = "FIRSTCODER_LIVE_ARTIFACT_DIR"
 # 默认一个正常 recall + 一个 stale/scope 安全拒绝 case；真实 provider 仍只需
 # 两个可控请求，既能观察回答质量，也能覆盖 fixture 的 provenance 语义。
 DEFAULT_LIVE_CASES = ("direct_recall_001", "temporal_rejection_001")
+LIVE_TOPIC_POOL = (
+    "project-conventions",
+    "key-decisions",
+    "dependency-facts",
+    "user-preferences",
+)
+LIVE_MEMORY_SYSTEM_RULES = (
+    "You are answering a memory benchmark. Use only relevant durable memory in the "
+    "system context. Do not inspect files or call tools. Give one short direct answer. "
+    "When stating a remembered fact, include both its subject and value rather than "
+    "returning only a bare value. If valid evidence is unavailable, say unknown and "
+    "do not guess."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,7 +177,7 @@ def _new_session(
 ) -> AgentSession:
     """创建完全隔离的 session，并显式注入临时 global store。"""
 
-    return AgentSession.create(
+    session = AgentSession.create(
         store=JsonlSessionStore(workspace / ".firstcoder" / "sessions"),
         session_id=session_id,
         agents_md="",
@@ -172,6 +185,10 @@ def _new_session(
         workspace_root=workspace,
         global_memory_store=global_store,
     )
+    # 评估约束属于本次 live run 的 system/base rules，不应混入 user query，
+    # 否则 retriever 会把 benchmark 说明词也当成 memory 搜索词。
+    session.base_rules = LIVE_MEMORY_SYSTEM_RULES
+    return session
 
 
 def _persist_fixture_case(
@@ -189,8 +206,14 @@ def _persist_fixture_case(
     persisted_notes: list[MemoryFixtureNote] = []
     stale_anchors: list[Path] = []
     workspace = Path(session.memory_store.workspace_root or session.memory_store.root)
+    if len(case.notes) > len(LIVE_TOPIC_POOL):
+        raise AssertionError(
+            "live fixture has more notes than the durable topic pool; add explicit topic mapping"
+        )
     for index, fixture_note in enumerate(case.notes):
-        topic = f"live-{case.case_id}-{index:02d}"
+        # DurableMemoryStore 的 topic 是受控的四项主题枚举；每个 case 最多使用
+        # 两条 note，轮换合法主题即可避免测试辅助层伪造不存在的 topic slug。
+        topic = LIVE_TOPIC_POOL[index % len(LIVE_TOPIC_POOL)]
         note_id = note_id_for(topic, fixture_note.text)
         evidence = MemoryEvidence(
             session_id=session.session_id,
@@ -261,7 +284,9 @@ def _run_provider_case(
         # live smoke 只需要短答案；低输出上限同时限制意外成本，且不改变
         # provider factory、AgentLoop 或 memory projector 的真实执行路径。
         temperature=profile.request.temperature if profile.request.temperature is not None else 0.0,
-        max_tokens=min(profile.request.max_tokens or 256, 256),
+        # DeepSeek 等 reasoning provider 会先消耗一部分 output budget 做内部
+        # 推理；256 可能在最终短答案前截断，live smoke 使用 512 仍保持低成本。
+        max_tokens=min(profile.request.max_tokens or 512, 512),
         extra_body=profile.request.extra_body,
     )
     loop = AgentLoop(
@@ -271,14 +296,15 @@ def _run_provider_case(
         context_window=profile.context_window,
         enable_delegate_tool=False,
     )
-    query = case.query
-    if case.expects_abstention:
-        # 安全 case 的质量断言不是要求模型猜中某种固定措辞；给真实模型一个
-        # 明确的拒答指令，观察它是否遵守“无有效证据就 unknown”的 benchmark 合同。
-        query = f"{query}. Use only valid evidence; if it is unavailable, say unknown and do not guess."
-    turn = asyncio.run(loop.run_user_turn(query))
+    # benchmark 指令已经放入 system/base rules；user message 保持原始 case query，
+    # 这样 MemoryProjector 的检索排名不会被评估说明中的通用词注入污染。
+    turn = asyncio.run(loop.run_user_turn(case.query))
     if turn.response is None:
         raise AssertionError(f"live provider returned no final response for case {case.case_id}")
+    if turn.response.finish_reason == "length":
+        raise AssertionError(
+            f"live provider response was truncated by output budget for case {case.case_id}"
+        )
 
     memory_events = [
         event.payload
@@ -288,7 +314,11 @@ def _run_provider_case(
     if not memory_events:
         raise AssertionError(f"AgentLoop did not write memory_retrieved for case {case.case_id}")
     trace_events = _trace_events(loop)
-    audit = correlate_memory_audit_events([*memory_events, *trace_events])
+    audit_events = [
+        {"type": "memory_retrieved", "payload": payload}
+        for payload in memory_events
+    ]
+    audit = correlate_memory_audit_events([*audit_events, *trace_events])
     if not audit.get("claimable"):
         raise AssertionError(
             f"live memory audit is not claimable for {case.case_id}: "
@@ -438,7 +468,7 @@ def test_live_provider_memory_benchmark_is_explicit_and_isolated(tmp_path: Path)
         global_store=visibility_global_store,
     )
     workspace_receipt = writer.memory_runtime.promote(
-        "release-policy",
+        "project-conventions",
         "release train is blue",
         source="live-smoke",
         visibility="workspace",
@@ -468,7 +498,7 @@ def test_live_provider_memory_benchmark_is_explicit_and_isolated(tmp_path: Path)
     stores.append(workspace_reader.memory_store)
 
     session_receipt = writer.memory_runtime.promote(
-        "private-policy",
+        "user-preferences",
         "private launch codename is aurora",
         source="live-smoke",
         visibility="session",
@@ -500,7 +530,7 @@ def test_live_provider_memory_benchmark_is_explicit_and_isolated(tmp_path: Path)
     stores.append(session_reader.memory_store)
 
     global_note = MemoryNote(
-        topic="global-policy",
+        topic="key-decisions",
         text="global support window is Friday",
         evidence=MemoryEvidence(scope="global", visibility="global"),
     )
@@ -531,7 +561,7 @@ def test_live_provider_memory_benchmark_is_explicit_and_isolated(tmp_path: Path)
         "global support window",
         include_global=True,
     )
-    assert [note.note_id for note in opted_in.selected_notes] == [note_id_for("global-policy", global_note.text)]
+    assert [note.note_id for note in opted_in.selected_notes] == [note_id_for("key-decisions", global_note.text)]
     live_runs.append(global_run)
     observations.append(global_run.observation)
     stores.append(global_reader.memory_store)
