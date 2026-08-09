@@ -235,6 +235,9 @@ def _new_session(
     # 评估约束属于本次 live run 的 system/base rules，不应混入 user query，
     # 否则 retriever 会把 benchmark 说明词也当成 memory 搜索词。
     session.base_rules = LIVE_MEMORY_SYSTEM_RULES
+    # live benchmark 的 abstention 契约是 evidence-only；普通 FirstCoder
+    # 默认保持 supplemental 模式，仍可在无 memory 命中时使用一般知识回答。
+    session.memory_projector.evidence_only = True
     return session
 
 
@@ -566,6 +569,14 @@ def test_live_provider_memory_benchmark_is_explicit_and_isolated(tmp_path: Path)
                 )
                 == "scope_mismatch"
             )
+        elif fixture_case.case_id == "temporal_rejection_004":
+            assert live_run.observation.selected_note_ids == ()
+            assert (
+                live_run.observation.rejected_reasons.get(
+                    live_run.observation.forbidden_memory_ids[0]
+                )
+                == "stale_evidence"
+            )
 
     visibility_workspace = tmp_path / "visibility-workspace"
     visibility_global_store = DurableMemoryStore(
@@ -686,6 +697,7 @@ def test_live_provider_memory_benchmark_is_explicit_and_isolated(tmp_path: Path)
         {
             "schema_version": 1,
             "mode": "live_smoke",
+            "memory_mode": "evidence_only",
             "case_count": len(observations),
             "case_categories": dict(
                 Counter(case.category for case in (*selected_cases, workspace_case, session_case, global_case))
@@ -704,6 +716,11 @@ def test_live_provider_memory_benchmark_is_explicit_and_isolated(tmp_path: Path)
     artifact_text = "\n".join(
         Path(path).read_text(encoding="utf-8")
         for path in paths.values()
+    )
+    artifact_json = json.loads(Path(paths["json"]).read_text(encoding="utf-8"))
+    assert artifact_json["memory_mode"] == "evidence_only"
+    assert "- Memory mode: evidence_only" in Path(paths["markdown"]).read_text(
+        encoding="utf-8"
     )
     assert "private launch codename is aurora" not in artifact_text
     assert "release train is blue" not in artifact_text

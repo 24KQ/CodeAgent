@@ -418,6 +418,27 @@ def test_memory_artifacts_keep_only_stable_safe_fields(tmp_path: Path) -> None:
     }
 
 
+def test_memory_artifact_preserves_evidence_only_mode_marker(tmp_path: Path) -> None:
+    """live evidence-only 结果必须能和旧 supplemental 结果明确区分。"""
+
+    paths = write_memory_eval_artifacts(
+        {
+            "schema_version": 1,
+            "mode": "live_smoke",
+            "memory_mode": "evidence_only",
+            "case_count": 0,
+            "variants": {},
+        },
+        tmp_path,
+    )
+
+    written = json.loads(Path(paths["json"]).read_text(encoding="utf-8"))
+    assert written["memory_mode"] == "evidence_only"
+    assert "- Memory mode: evidence_only" in Path(paths["markdown"]).read_text(
+        encoding="utf-8"
+    )
+
+
 def test_shared_writer_can_render_memory_rows_without_cost_columns(tmp_path: Path) -> None:
     """共享 writer 的 memory 模式不应伪造 usage 字段，cost 默认行为仍保留。"""
 

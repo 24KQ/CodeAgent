@@ -205,6 +205,75 @@ def test_empty_memory_projection_records_abstention_audit_for_real_query(tmp_pat
     assert evaluated["associations"][0]["projection_empty"] is True
 
 
+def test_evidence_only_projection_exposes_missing_memory_evidence(tmp_path: Path) -> None:
+    """严格 evidence-only 请求必须把“无证据”状态明确传给 provider。"""
+
+    session = _session(tmp_path, session_id="evidence-only-empty")
+    default_message, _ = session.memory_projector.build_message_with_metadata(
+        "global support window",
+    )
+    assert default_message is None
+    session.memory_projector.evidence_only = True
+
+    message, projection = session.memory_projector.build_message_with_metadata(
+        "global support window",
+    )
+
+    assert message is not None
+    assert projection.selected_note_ids == ()
+    assert "No valid durable memory was selected" in message.content
+    assert "only valid answer is exactly the single word 'unknown'" in message.content
+
+
+def test_evidence_only_audit_keeps_empty_selection_semantics(tmp_path: Path) -> None:
+    """状态提示不能把无命中检索伪装成已选 memory。"""
+
+    session = _session(tmp_path, session_id="evidence-only-audit")
+    session.memory_projector.evidence_only = True
+    provider = _FixtureProvider(
+        [
+            ChatResponse(
+                provider="fixture",
+                model="fixture-model",
+                content="unknown",
+                finish_reason="stop",
+            )
+        ]
+    )
+
+    result = AgentLoop(session=session, provider=provider)._run_user_turn_sync(
+        "global support window",
+    )
+
+    assert result.response is not None
+    events = [
+        event
+        for event in session.store.list_events(session.session_id)
+        if event.type == "memory_retrieved"
+    ]
+    assert len(events) == 1
+    assert events[0].payload["evidence_only"] is True
+    assert events[0].payload["projection_empty"] is True
+    assert events[0].payload["selected_note_ids"] == []
+    payload = events[0].payload
+    evaluated = correlate_memory_audit_events(
+        [
+            {"type": "memory_retrieved", "payload": payload},
+            {
+                "event": "prompt_built",
+                "request_id": payload["request_id"],
+                "projection_fingerprint": payload["projection_fingerprint"],
+            },
+            {
+                "event": "model_requested",
+                "request_id": payload["request_id"],
+                "projection_fingerprint": payload["projection_fingerprint"],
+            },
+        ]
+    )
+    assert evaluated["associations"][0]["evidence_only"] is True
+
+
 def test_agent_loop_does_not_project_generic_build_note_for_full_evaluation_prompt(
     tmp_path: Path,
 ) -> None:

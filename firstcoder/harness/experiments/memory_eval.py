@@ -25,6 +25,7 @@ from firstcoder.memory.models import MemoryQuery
 from firstcoder.memory.retrieval import MemoryRetriever, tokenize_memory_text
 
 CHALLENGE_VARIANTS = ("memory_on", "memory_off", "naive_recent", "unsafe_memory")
+_MEMORY_MODES = {"supplemental", "evidence_only"}
 MEMORY_METRICS = (
     "evidence_recall",
     "evidence_precision",
@@ -875,6 +876,7 @@ def correlate_memory_audit_events(
                     if str(note_id)
                 ],
                 "include_global": bool(memory_meta.get("include_global", False)),
+                "evidence_only": bool(memory_meta.get("evidence_only", False)),
                 "projection_empty": bool(memory_meta.get("projection_empty", False)),
                 "confidence": confidence,
                 "prompt_built": bool(matched_prompts),
@@ -963,6 +965,7 @@ def _event_metadata(payload: Mapping[str, Any], *, event_name: str) -> dict[str,
         "query_hash": str(merged.get("query_hash") or ""),
         "selected_note_ids": list(merged.get("selected_note_ids") or []),
         "include_global": bool(merged.get("include_global", False)),
+        "evidence_only": bool(merged.get("evidence_only", False)),
         "projection_empty": bool(merged.get("projection_empty", False)),
     }
 
@@ -1009,6 +1012,9 @@ def render_memory_eval_report(payload: Mapping[str, Any]) -> str:
         "| Variant | Cases | Pass rate | Evidence recall | Stale use | Secret exposure | Abstention | False resume |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
+    if payload.get("memory_mode") in _MEMORY_MODES:
+        # 该字段已由 sanitizer 限制为受控值，因此可以安全地进入短报告。
+        lines.insert(6, f"- Memory mode: {payload['memory_mode']}")
     for variant in CHALLENGE_VARIANTS:
         data = dict((payload.get("variants", {}) or {}).get(variant, {}) or {})
         summary = dict(data.get("summary", {}) or {})
@@ -1551,6 +1557,11 @@ def _sanitize_memory_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
         },
         "variants": {},
     }
+    # 只保留受控的 memory 模式标记；evidence-only 与普通 supplemental 结果
+    # 的回答契约不同，报告必须能明确区分，不能依赖调用方的自由文本。
+    memory_mode = str(payload.get("memory_mode") or "")
+    if memory_mode in _MEMORY_MODES:
+        safe["memory_mode"] = memory_mode
     # provider/model/usage 只作为 live benchmark 的来源标记；只接受短标识和
     # 有限数值，绝不把 base URL、token、prompt 或 provider 原始响应写出。
     for field_name in ("provider", "model", "usage_source"):
