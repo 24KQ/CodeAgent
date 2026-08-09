@@ -1,15 +1,19 @@
-# FirstCoder 项目级配置：使用 DeepSeek 的 OpenAI 兼容接口。
-# API Key 放在 .env 文件的 DEEPSEEK_API_KEY 里（.env 已被 gitignore）。
-default_model = "deepseek/deepseek-chat"
+# FirstCoder 项目级配置：使用 Vote520 的 OpenAI 兼容接口。
+# API Key 放在 .env 文件的 VOTE520_API_KEY 里（.env 已被 gitignore）。
+default_model = "vote520/gpt-5.6-luna"
 
-[providers.deepseek]
+[providers.vote520]
 type = "openai-compatible"
-base_url = "https://api.deepseek.com/v1"
-api_key_env = "DEEPSEEK_API_KEY"
+base_url = "https://ai.vote520.com/v1"
+api_key_env = "VOTE520_API_KEY"
 
-[models."deepseek/deepseek-chat"]
-label = "DeepSeek Chat"
-context_window = 65536
+[models."vote520/gpt-5.6-luna"]
+label = "GPT 5.6 Luna"
+context_window = 128000
+
+[models."vote520/gpt-5.6-luna".request]
+temperature = 0.0
+reasoning_effort = "xhigh"
 
 [permissions]
 mode = "ask"
