@@ -22,6 +22,12 @@ DEFAULT_MEMORY_NOTE_LIMIT = 5
 DEFAULT_MEMORY_CHAR_LIMIT = 6_000
 _REDACTION_LOOKAHEAD_CHARS = 256
 _OMITTED = "\n[其余记忆已按预算省略]"
+_NO_EVIDENCE_STATUS = (
+    "## Durable Memory Retrieval Status\n"
+    "No valid durable memory was selected for this query. In evidence-only mode, "
+    "the only valid answer is exactly the single word 'unknown'. Return that word "
+    "and nothing else; do not infer or guess a fact from general knowledge.\n"
+)
 
 
 def load_memory_index_text(
@@ -130,6 +136,7 @@ class MemoryProjection:
     selected_note_ids: tuple[str, ...] = ()
     rejected_reasons: tuple[tuple[str, str], ...] = ()
     include_global: bool = False
+    evidence_only: bool = False
 
 
 class MemoryProjector:
@@ -145,12 +152,15 @@ class MemoryProjector:
         security: MemoryRedactor | None = None,
         max_notes: int = DEFAULT_MEMORY_NOTE_LIMIT,
         max_chars: int = DEFAULT_MEMORY_CHAR_LIMIT,
+        evidence_only: bool = False,
         audit: Callable[[RetrievalResult], None] | None = None,
     ) -> None:
         if isinstance(max_notes, bool) or not isinstance(max_notes, int) or max_notes < 0:
             raise ValueError("max_notes must be a non-negative integer")
         if isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars <= 0:
             raise ValueError("max_chars must be a positive integer")
+        if not isinstance(evidence_only, bool):
+            raise TypeError("evidence_only must be a bool")
         self.store = store
         self.workspace_root = workspace_root if workspace_root is not None else store.workspace_root
         self.session_id = str(session_id or "")
@@ -158,6 +168,9 @@ class MemoryProjector:
         self.security = security or MemoryRedactor()
         self.max_notes = max_notes
         self.max_chars = max_chars
+        # 普通 FirstCoder 对话允许模型使用一般知识；只有显式 evidence-only
+        # 请求才在无命中时注入“无证据”状态，避免把辅助 memory 变成全局拒答策略。
+        self.evidence_only = evidence_only
         self.audit = audit
 
     def retrieve(
@@ -237,14 +250,17 @@ class MemoryProjector:
         )
 
         if not selected:
-            # 没有 query 或没有通过 scope 过滤的命中时，不给请求增加一条
-            # 只包含通用说明的 system message，也不泄漏未过滤 index。
+            # 普通模式没有 query 或没有通过 scope 过滤的命中时，不给请求增加一条
+            # 只包含通用说明的 system message；严格模式则显式告诉 provider 当前
+            # 没有可用证据。两种模式都不泄漏未过滤 index 或被拒绝 note 正文。
+            status = _NO_EVIDENCE_STATUS if self.evidence_only and normalized_query else ""
             return MemoryProjection(
-                text="",
+                text=status,
                 query_hash=result.query_hash if result is not None else "",
                 selected_note_ids=selected_note_ids,
                 rejected_reasons=rejected_reasons,
                 include_global=include_global,
+                evidence_only=self.evidence_only,
             )
 
         section = build_memory_system_section(
@@ -269,6 +285,7 @@ class MemoryProjector:
             selected_note_ids=selected_note_ids,
             rejected_reasons=rejected_reasons,
             include_global=include_global,
+            evidence_only=self.evidence_only,
         )
 
     def build_message_with_metadata(

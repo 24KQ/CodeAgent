@@ -493,9 +493,10 @@ class AgentSession:
                     note_id: reason for note_id, reason in projection.rejected_reasons
                 },
                 "include_global": bool(projection.include_global),
-                # 空 projection 仍可能是一次有效的无命中检索；把它显式标出，
-                # 评估器可以把 abstention 与“没有执行检索”区分开。
-                "projection_empty": not bool(projection.text),
+                "evidence_only": bool(projection.evidence_only),
+                # 没有 selected note 仍是一次有效的无证据检索；状态提示本身
+                # 不应让评估器把它误认为命中了 memory。
+                "projection_empty": not bool(projection.selected_note_ids),
                 "selected_count": len(projection.selected_note_ids),
             }
         )
